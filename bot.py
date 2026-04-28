@@ -150,7 +150,7 @@ def _build_ffmpeg_cmd(
     input_path: str,
     output_path: str,
     mode: str,
-    track_idx: int = 0,
+    track_idx: int | None = None,
     new_title: str | None = None,
 ) -> list | None:
     """Build a stream-copy FFmpeg command for the given mode and track."""
@@ -161,7 +161,7 @@ def _build_ffmpeg_cmd(
         return base + ["-map", "0", "-c", "copy", output_path]
 
     # Isolate: keep video + only the selected audio track.
-    if mode == "isolate":
+    if mode == "isolate" and track_idx is not None:
         return base + [
             "-map", "0:v:0",
             "-map", f"0:a:{track_idx}",
@@ -170,7 +170,7 @@ def _build_ffmpeg_cmd(
         ]
 
     # Default: keep all tracks, set the selected audio as default.
-    if mode == "default":
+    if mode == "default" and track_idx is not None:
         return base + [
             "-map", "0",
             "-c", "copy",
@@ -180,7 +180,7 @@ def _build_ffmpeg_cmd(
         ]
 
     # Metadata: keep all tracks, rename the selected audio track.
-    if mode == "metadata" and new_title is not None:
+    if mode == "metadata" and track_idx is not None and new_title is not None:
         return base + [
             "-map", "0",
             "-c", "copy",
@@ -194,7 +194,10 @@ def _build_ffmpeg_cmd(
 # ── Dynamic track helpers ─────────────────────────────────────────────────────
 
 def _format_track_lines(tracks: list[dict]) -> str:
-    """Render a human-readable list of audio tracks for message text."""
+    """Render a human-readable list of ffprobe audio tracks for message text.
+
+    Expected keys per track: codec_name, channels, and tags.language (optional).
+    """
     return "\n".join(
         f"  Track {i + 1}: `{t.get('codec_name', '?')}` | "
         f"lang=`{t.get('tags', {}).get('language', 'und')}` | "
@@ -204,7 +207,12 @@ def _format_track_lines(tracks: list[dict]) -> str:
 
 
 def _track_button_label(track_idx: int, track: dict) -> str:
-    """Build a friendly label for the inline track buttons."""
+    """Build a friendly label for the inline track buttons.
+
+    Args:
+        track_idx: Zero-based index from the ffprobe audio list.
+        track: ffprobe audio stream dict with optional "tags" such as language/title.
+    """
     tags = track.get("tags") or {}
     language = (tags.get("language") or "und").title()
     title = tags.get("title")
@@ -236,7 +244,13 @@ def _build_dynamic_keyboard(
     tracks: list[dict],
     menu: str = "main",
 ) -> InlineKeyboardMarkup:
-    """Build a multi-level, track-driven inline keyboard."""
+    """Build a multi-level, track-driven inline keyboard.
+
+    Args:
+        op_id: Operation identifier to preserve state across callbacks.
+        tracks: ffprobe audio stream dicts used to build per-track buttons.
+        menu: One of "main", "isolate", "default", "metadata".
+    """
     # Main menu: high-level actions only.
     if menu == "main":
         return InlineKeyboardMarkup(
@@ -471,7 +485,7 @@ async def on_callback(client: Client, query: CallbackQuery) -> None:
                 input_path=input_path,
                 output_path=output_path,
                 mode=mode,
-                track_idx=selected_track_idx if selected_track_idx is not None else 0,
+                track_idx=selected_track_idx,
             )
             if cmd is None:
                 await query.message.edit_text("❌ Unknown mux mode.")
