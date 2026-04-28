@@ -1,0 +1,6 @@
+# Core Telegram / Pyrogram stack
+pyrogram>=2.0.106
+TgCrypto>=1.2.5
+
+# Environment variable loading
+python-dotenv>=1.0.0
