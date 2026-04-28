@@ -54,6 +54,8 @@ app = Client(
 #   "awaiting_metadata_msg_id": int | None,
 # }
 pending_ops: dict[str, dict] = {}
+# Reverse lookup: prompt message ID -> op_id (fast metadata reply matching).
+pending_metadata_prompts: dict[int, str] = {}
 _op_counter: int = 0
 
 # Progress-bar throttle: msg_id → last_update_monotonic
@@ -204,6 +206,11 @@ def _format_track_lines(tracks: list[dict]) -> str:
         f"ch={t.get('channels', '?')}"
         for i, t in enumerate(tracks)
     ) or "  _(none detected)_"
+
+
+def _is_track_index_valid(track_idx: int | None, tracks: list[dict]) -> bool:
+    """Validate that a selected audio index exists in the ffprobe track list."""
+    return track_idx is not None and 0 <= track_idx < len(tracks)
 
 
 def _track_button_label(track_idx: int, track: dict) -> str:
@@ -400,6 +407,9 @@ async def on_callback(client: Client, query: CallbackQuery) -> None:
     if action == "cancel" and len(parts) == 2:
         op = pending_ops.pop(parts[1], None)
         if op:
+            prompt_id = op.get("awaiting_metadata_msg_id")
+            if prompt_id:
+                pending_metadata_prompts.pop(prompt_id, None)
             _cleanup(op["input"])
         await query.message.edit_text(
             "🗑 **Cancelled. Temporary files deleted.**",
@@ -434,17 +444,21 @@ async def on_callback(client: Client, query: CallbackQuery) -> None:
         except ValueError:
             await query.answer("Invalid track selection.", show_alert=True)
             return
-        if track_idx < 0 or track_idx >= len(op["tracks"]):
+        if not _is_track_index_valid(track_idx, op["tracks"]):
             await query.answer("Track out of range.", show_alert=True)
             return
 
         # Remember which track is awaiting metadata so the reply handler can map it.
+        old_prompt_id = op.get("awaiting_metadata_msg_id")
+        if old_prompt_id:
+            pending_metadata_prompts.pop(old_prompt_id, None)
         op["awaiting_metadata_for_track"] = track_idx
         prompt = await query.message.reply(
             f"📝 **Send new title for Track {track_idx + 1}.**",
             reply_markup=ForceReply(selective=True),
         )
         op["awaiting_metadata_msg_id"] = prompt.id
+        pending_metadata_prompts[prompt.id] = op_id
         await query.answer("Waiting for new title…")
         return
 
@@ -465,16 +479,15 @@ async def on_callback(client: Client, query: CallbackQuery) -> None:
             await query.answer("Session expired. Please resend the file.", show_alert=True)
             return
         if mode in {"isolate", "default"}:
-            if (
-                selected_track_idx is None
-                or selected_track_idx < 0
-                or selected_track_idx >= len(op["tracks"])
-            ):
+            if not _is_track_index_valid(selected_track_idx, op["tracks"]):
                 await query.answer("Track out of range.", show_alert=True)
                 return
 
         # We are executing now, so remove the op from the registry.
         op = pending_ops.pop(op_id)
+        prompt_id = op.get("awaiting_metadata_msg_id")
+        if prompt_id:
+            pending_metadata_prompts.pop(prompt_id, None)
         input_path: str = op["input"]
         chat_id: int = op["chat_id"]
         base_name = Path(input_path).stem
@@ -513,30 +526,39 @@ async def on_metadata_text(client: Client, message: Message) -> None:
     if not message.reply_to_message:
         return
 
-    # Match this reply to the pending op that issued the ForceReply prompt.
-    matched_op_id: str | None = None
-    for op_id, op in pending_ops.items():
-        if (
-            op.get("awaiting_metadata_msg_id") == message.reply_to_message.id
-            and op.get("chat_id") == message.chat.id
-        ):
-            matched_op_id = op_id
-            break
-
+    # Fast lookup: prompt message ID -> op_id.
+    prompt_id = message.reply_to_message.id
+    matched_op_id = pending_metadata_prompts.get(prompt_id)
     if matched_op_id is None:
+        return
+
+    op = pending_ops.get(matched_op_id)
+    if op is None or op.get("chat_id") != message.chat.id:
+        pending_metadata_prompts.pop(prompt_id, None)
+        return
+
+    track_idx = op.get("awaiting_metadata_for_track")
+    if not _is_track_index_valid(track_idx, op["tracks"]):
+        await message.reply("❌ **Track selection expired. Please resend the file.**")
+        pending_metadata_prompts.pop(prompt_id, None)
+        pending_ops.pop(matched_op_id, None)
         return
 
     new_title = (message.text or "").strip()
     if not new_title:
-        await message.reply("❌ **Title cannot be empty. Reply again with a name.**")
+        # Keep the op active and re-issue a fresh ForceReply prompt.
+        new_prompt = await message.reply(
+            f"❌ **Title cannot be empty. Send a name for Track {track_idx + 1}.**",
+            reply_markup=ForceReply(selective=True),
+        )
+        pending_metadata_prompts.pop(prompt_id, None)
+        op["awaiting_metadata_msg_id"] = new_prompt.id
+        pending_metadata_prompts[new_prompt.id] = matched_op_id
         return
 
     # Remove the op from registry; we are executing the final mux now.
     op = pending_ops.pop(matched_op_id)
-    track_idx = op.get("awaiting_metadata_for_track")
-    if track_idx is None or track_idx < 0 or track_idx >= len(op["tracks"]):
-        await message.reply("❌ **Track selection expired. Please resend the file.**")
-        return
+    pending_metadata_prompts.pop(prompt_id, None)
 
     input_path: str = op["input"]
     chat_id: int = op["chat_id"]
