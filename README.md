@@ -22,9 +22,14 @@ Hosted on an Oracle ARM Free Tier server; performs **stream-copy only** (`-c cop
 | Menu | Button | FFmpeg mapping |
 |---|---|---|
 | Main | 🎬 Just Convert to MP4 | `-map 0 -c copy` |
-| Main → Isolate | 🎵 Track *N* | `-map 0:v:0 -map 0:a:{track_idx} -c copy` |
-| Main → Set Default | 🎵 Track *N* | `-map 0 -c copy -disposition:a 0 -disposition:a:{track_idx} default` |
-| Main → Edit Metadata | 🎵 Track *N* | `-map 0 -c copy -metadata:s:a:{track_idx} title="<new title>"` |
+| Main → Isolate Audio | 🎵 Track *N* | `-map 0:v:0 -map 0:a:{track_idx} -c copy` |
+| Main → Set Default Track | 🎵 Track *N* | `-map 0 -c copy -disposition:a 0 -disposition:a:{track_idx} default` |
+| Main → Edit Audio Metadata | 🎵 Track *N* | `-map 0 -c copy -metadata:s:a:{track_idx} title="<new title>"` |
+| Main → Remove Specific Audios | ✅ Execute Selected | `-map 0:v:0 -map 0:a:{keep_idx} -c copy` |
+| Main → Remove Specific Subtitles | ✅ Execute Selected | `-map 0:v:0 -map 0:s:{keep_idx} -c copy` |
+| Main | 🧹 Remove All Subtitles | `-map 0:v -map 0:a -c copy -sn` |
+| Main → Multi-Extract | ✅ Execute Selected | `-map 0:<type>:<idx> -c copy` |
+| Main → Add External Track | Convert/Keep + optional metadata edit | `-map 0 -map 1 -c copy` (+ optional AAC re-encode) |
 | Main | 🗑 Cancel | Removes the downloaded file immediately |
 
 ---
