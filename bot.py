@@ -45,6 +45,7 @@ SUBTITLE_CODEC_EXTENSIONS = {
     "ass": ".ass",
     "webvtt": ".vtt",
 }
+# Commonly supported web audio codecs (HTML5 <audio> baseline support).
 WEB_COMPATIBLE_AUDIO_CODECS = {"aac", "mp3", "opus"}
 AAC_HIGH_BITRATE = "640k"
 
@@ -624,6 +625,8 @@ async def _issue_metadata_prompt(
     prompt_text: str | None = None,
 ) -> None:
     """Send a ForceReply prompt and register the reply-to-op lookup."""
+    # Prompts are issued on the single asyncio event loop, so mapping updates are
+    # serialized per update and safe for this lightweight in-memory state.
     _clear_metadata_prompt(op.get("awaiting_metadata_msg_id"))
     op["awaiting_metadata_for_track"] = track_idx
     op["awaiting_metadata_stream_type"] = stream_type
@@ -791,8 +794,9 @@ async def _upload_post_add_result(
 )
 async def on_video(client: Client, message: Message) -> None:
     """Auto-detect MKV/MP4, download, probe, and present mux options."""
-    # Ignore replies meant for external-track uploads; handled elsewhere.
+    # Prevent external-track reply prompts from being treated as new video tasks.
     if message.reply_to_message and message.reply_to_message.id in pending_external_prompts:
+        await message.reply("❌ Please upload the external track as an audio/document file.")
         return
     file_obj = message.video or message.document
     if file_obj is None:
@@ -811,6 +815,8 @@ async def on_video(client: Client, message: Message) -> None:
         if raw_name
         else f"video_{file_obj.file_unique_id}{ext or '.mp4'}"
     )
+    if safe_name.startswith(("-", ".")):
+        safe_name = f"file_{safe_name.lstrip('.-') or 'upload'}"
     input_path = DOWNLOADS_DIR / safe_name
 
     status_msg = await message.reply("⬇️ **Downloading…**")
@@ -1003,8 +1009,7 @@ async def on_callback(client: Client, query: CallbackQuery) -> None:
             selected = sorted(op["selected_extract"])
             outputs: list[str] = []
             try:
-                _clear_metadata_prompt(op.get("awaiting_metadata_msg_id"))
-                _clear_external_prompt(op.get("awaiting_external_msg_id"))
+                status_msg = await query.message.reply("⚙️ **Extracting…**")
                 for key in selected:
                     stream_type, idx_str = key.split(":")
                     track_idx = int(idx_str)
@@ -1023,7 +1028,6 @@ async def on_callback(client: Client, query: CallbackQuery) -> None:
                         extract_path = _output_path_for(input_path, f"s{track_idx + 1}", ext)
                         cmd = _build_extract_cmd(input_path, extract_path, "subtitle", track_idx)
                     outputs.append(extract_path)
-                    status_msg = await query.message.reply("⚙️ **Extracting…**")
                     await _execute_mux(
                         client=client,
                         status_msg=status_msg,
@@ -1251,6 +1255,8 @@ async def on_external_upload(client: Client, message: Message) -> None:
     raw_name = getattr(file_obj, "file_name", None) or ""
     ext = Path(raw_name).suffix.lower() if raw_name else ""
     safe_name = Path(raw_name).name if raw_name else f"external_{file_obj.file_unique_id}{ext or '.bin'}"
+    if safe_name.startswith(("-", ".")):
+        safe_name = f"file_{safe_name.lstrip('.-') or 'upload'}"
     external_path = DOWNLOADS_DIR / f"external_{op_id}_{safe_name}"
 
     status_msg = await message.reply("⬇️ **Downloading external file…**")
@@ -1364,7 +1370,7 @@ async def on_metadata_text(client: Client, message: Message) -> None:
     if not _is_track_index_valid(track_idx, track_list):
         await message.reply("❌ **Track selection expired. Please resend the file.**")
         _clear_metadata_prompt(prompt_id)
-        pending_ops.pop(matched_op_id, None)
+        pending_ops.pop(op_id, None)
         return
 
     new_title = (message.text or "").strip()
