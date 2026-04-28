@@ -205,7 +205,7 @@ def _format_track_lines(tracks: list[dict]) -> str:
 
 def _track_button_label(track_idx: int, track: dict) -> str:
     """Build a friendly label for the inline track buttons."""
-    tags = track.get("tags", {}) or {}
+    tags = track.get("tags") or {}
     language = (tags.get("language") or "und").title()
     title = tags.get("title")
     descriptor = f"{title} / {language}" if title else language
@@ -438,10 +438,10 @@ async def on_callback(client: Client, query: CallbackQuery) -> None:
     if action == "mux" and len(parts) in {3, 4}:
         mode = parts[1]
         op_id = parts[-1]
-        track_idx: int | None = None
+        selected_track_idx: int | None = None
         if len(parts) == 4:
             try:
-                track_idx = int(parts[2])
+                selected_track_idx = int(parts[2])
             except ValueError:
                 await query.answer("Invalid track selection.", show_alert=True)
                 return
@@ -451,7 +451,11 @@ async def on_callback(client: Client, query: CallbackQuery) -> None:
             await query.answer("Session expired. Please resend the file.", show_alert=True)
             return
         if mode in {"isolate", "default"}:
-            if track_idx is None or track_idx < 0 or track_idx >= len(op["tracks"]):
+            if (
+                selected_track_idx is None
+                or selected_track_idx < 0
+                or selected_track_idx >= len(op["tracks"])
+            ):
                 await query.answer("Track out of range.", show_alert=True)
                 return
 
@@ -467,7 +471,7 @@ async def on_callback(client: Client, query: CallbackQuery) -> None:
                 input_path=input_path,
                 output_path=output_path,
                 mode=mode,
-                track_idx=track_idx or 0,
+                track_idx=selected_track_idx if selected_track_idx is not None else 0,
             )
             if cmd is None:
                 await query.message.edit_text("❌ Unknown mux mode.")
