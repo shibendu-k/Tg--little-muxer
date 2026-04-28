@@ -47,6 +47,7 @@ SUBTITLE_CODEC_EXTENSIONS = {
 }
 # Commonly supported web audio codecs (HTML5 <audio> baseline support).
 WEB_COMPATIBLE_AUDIO_CODECS = {"aac", "mp3", "opus"}
+# High-bitrate AAC target for external-track conversion to preserve channels.
 AAC_HIGH_BITRATE = "640k"
 
 MUX_MODE_MAP = {
@@ -248,6 +249,14 @@ def _parse_toggle_callback(parts: list[str]) -> tuple[str, str, int, str] | None
     except ValueError:
         return None
     return menu, stream_key, track_idx, op_id
+
+
+def _sanitize_filename(name: str) -> str:
+    """Ensure filenames do not start with '.' or '-' to avoid hidden/flagged names."""
+    if name.startswith((".", "-")):
+        trimmed = name[1:] or "upload"
+        return f"file_{trimmed}"
+    return name
 
 def _build_ffmpeg_cmd(
     input_path: str,
@@ -815,8 +824,7 @@ async def on_video(client: Client, message: Message) -> None:
         if raw_name
         else f"video_{file_obj.file_unique_id}{ext or '.mp4'}"
     )
-    if safe_name.startswith(("-", ".")):
-        safe_name = f"file_{safe_name.lstrip('.-') or 'upload'}"
+    safe_name = _sanitize_filename(safe_name)
     input_path = DOWNLOADS_DIR / safe_name
 
     status_msg = await message.reply("⬇️ **Downloading…**")
@@ -1255,8 +1263,7 @@ async def on_external_upload(client: Client, message: Message) -> None:
     raw_name = getattr(file_obj, "file_name", None) or ""
     ext = Path(raw_name).suffix.lower() if raw_name else ""
     safe_name = Path(raw_name).name if raw_name else f"external_{file_obj.file_unique_id}{ext or '.bin'}"
-    if safe_name.startswith(("-", ".")):
-        safe_name = f"file_{safe_name.lstrip('.-') or 'upload'}"
+    safe_name = _sanitize_filename(safe_name)
     external_path = DOWNLOADS_DIR / f"external_{op_id}_{safe_name}"
 
     status_msg = await message.reply("⬇️ **Downloading external file…**")
