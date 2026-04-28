@@ -31,6 +31,29 @@ BOT_TOKEN: str = os.environ["BOT_TOKEN"]
 LOCAL_API_URL: str = os.environ.get("LOCAL_API_URL", "http://localhost:8081")
 ADMIN_USER_ID: int = int(os.environ["ADMIN_USER_ID"])
 
+# ── Codec/constants ───────────────────────────────────────────────────────────
+
+AUDIO_CODEC_EXTENSIONS = {
+    "eac3": ".eac3",
+    "ac3": ".ac3",
+    "aac": ".m4a",
+    "dts": ".dts",
+    "flac": ".flac",
+}
+SUBTITLE_CODEC_EXTENSIONS = {
+    "subrip": ".srt",
+    "ass": ".ass",
+    "webvtt": ".vtt",
+}
+WEB_COMPATIBLE_AUDIO_CODECS = {"aac", "mp3", "opus"}
+AAC_HIGH_BITRATE = "640k"
+
+MUX_MODE_MAP = {
+    "convert": "convert",
+    "isolate_audio": "isolate",
+    "default_audio": "default",
+}
+
 # ── Storage ───────────────────────────────────────────────────────────────────
 DOWNLOADS_DIR = Path("downloads")
 DOWNLOADS_DIR.mkdir(exist_ok=True)
@@ -76,23 +99,6 @@ _op_counter: int = 0
 # Progress-bar throttle: msg_id → last_update_monotonic
 _progress_ts: dict[int, float] = {}
 _PROGRESS_INTERVAL = 2.0  # seconds between edits
-
-# ── Codec/extension helpers ────────────────────────────────────────────────────
-
-AUDIO_CODEC_EXTENSIONS = {
-    "eac3": ".eac3",
-    "ac3": ".ac3",
-    "aac": ".m4a",
-    "dts": ".dts",
-    "flac": ".flac",
-}
-SUBTITLE_CODEC_EXTENSIONS = {
-    "subrip": ".srt",
-    "ass": ".ass",
-    "webvtt": ".vtt",
-}
-WEB_AUDIO_CODECS = {"aac", "mp3", "opus"}
-AAC_HIGH_BITRATE = "640k"
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -203,7 +209,7 @@ def _codec_extension(codec_name: str | None, mapping: dict[str, str]) -> str:
         codec_key = codec_name.lower()
         if codec_key in mapping:
             return mapping[codec_key]
-        if codec_key.isalnum():
+        if all(ch.isalnum() or ch in {"_", "-"} for ch in codec_key):
             return _sanitize_extension(codec_key)
     return ".bin"
 
@@ -217,6 +223,30 @@ def _output_path_for(input_path: str, suffix: str, ext: str = ".mp4") -> str:
     """Build an output path in the downloads directory."""
     base_name = Path(input_path).stem
     return str(DOWNLOADS_DIR / f"{base_name}_{suffix}{ext}")
+
+
+def _parse_toggle_callback(parts: list[str]) -> tuple[str, str, int, str] | None:
+    """Parse toggle callback data into (menu, stream_key, track_idx, op_id)."""
+    if len(parts) < 4:
+        return None
+    toggle_mode = parts[1]
+    if toggle_mode == "extract" and len(parts) == 5:
+        stream_key = parts[2]
+        op_id = parts[4]
+        track_str = parts[3]
+        menu = "extract"
+    elif toggle_mode in {"remove_audio", "remove_subs"} and len(parts) == 4:
+        stream_key = toggle_mode
+        op_id = parts[3]
+        track_str = parts[2]
+        menu = toggle_mode
+    else:
+        return None
+    try:
+        track_idx = int(track_str)
+    except ValueError:
+        return None
+    return menu, stream_key, track_idx, op_id
 
 def _build_ffmpeg_cmd(
     input_path: str,
@@ -875,27 +905,14 @@ async def on_callback(client: Client, query: CallbackQuery) -> None:
 
     # ── Toggle multi-select state ────────────────────────────────────────────
     if action == "toggle" and len(parts) >= 4:
-        toggle_mode = parts[1]
-        if toggle_mode == "extract" and len(parts) == 5:
-            stream_key = parts[2]
-            track_str = parts[3]
-            op_id = parts[4]
-        elif toggle_mode in {"remove_audio", "remove_subs"} and len(parts) == 4:
-            stream_key = toggle_mode
-            track_str = parts[2]
-            op_id = parts[3]
-        else:
+        parsed = _parse_toggle_callback(parts)
+        if parsed is None:
             await query.answer("Invalid selection.", show_alert=True)
             return
-
+        menu, stream_key, track_idx, op_id = parsed
         op = pending_ops.get(op_id)
         if op is None:
             await query.answer("Session expired. Please resend the file.", show_alert=True)
-            return
-        try:
-            track_idx = int(track_str)
-        except ValueError:
-            await query.answer("Invalid track selection.", show_alert=True)
             return
 
         if stream_key == "remove_audio":
@@ -906,7 +923,6 @@ async def on_callback(client: Client, query: CallbackQuery) -> None:
                 op["selected_audio"].remove(track_idx)
             else:
                 op["selected_audio"].add(track_idx)
-            menu = "remove_audio"
         elif stream_key == "remove_subs":
             if not _is_track_index_valid(track_idx, op["streams"]["subtitle"]):
                 await query.answer("Track out of range.", show_alert=True)
@@ -915,7 +931,6 @@ async def on_callback(client: Client, query: CallbackQuery) -> None:
                 op["selected_subtitles"].remove(track_idx)
             else:
                 op["selected_subtitles"].add(track_idx)
-            menu = "remove_subs"
         else:
             key = f"{stream_key}:{track_idx}"
             if stream_key == "v" and not op["streams"]["video"]:
@@ -931,7 +946,6 @@ async def on_callback(client: Client, query: CallbackQuery) -> None:
                 op["selected_extract"].remove(key)
             else:
                 op["selected_extract"].add(key)
-            menu = "extract"
 
         await query.message.edit_text(
             _render_menu_text(op["safe_name"], op["streams"], menu),
@@ -1181,12 +1195,7 @@ async def on_callback(client: Client, query: CallbackQuery) -> None:
                     output_path,
                 ]
             else:
-                mode_map = {
-                    "convert": "convert",
-                    "isolate_audio": "isolate",
-                    "default_audio": "default",
-                }
-                ffmpeg_mode = mode_map.get(mode)
+                ffmpeg_mode = MUX_MODE_MAP.get(mode)
                 if ffmpeg_mode is None:
                     await query.message.edit_text("❌ Unknown mux mode.")
                     return
@@ -1252,8 +1261,10 @@ async def on_external_upload(client: Client, message: Message) -> None:
             progress=_progress,
             progress_args=(status_msg, "Downloading"),
         )
-    except Exception:
-        await status_msg.edit_text("❌ External download failed.")
+    except Exception as exc:
+        await status_msg.edit_text(
+            f"❌ External download failed ({type(exc).__name__}). Please retry."
+        )
         _cleanup(str(external_path))
         return
 
@@ -1271,7 +1282,7 @@ async def on_external_upload(client: Client, message: Message) -> None:
             return
         codec_name = streams["audio"][0].get("codec_name", "")
         op["external_codec"] = codec_name
-        if codec_name.lower() not in WEB_AUDIO_CODECS:
+        if codec_name.lower() not in WEB_COMPATIBLE_AUDIO_CODECS:
             await status_msg.edit_text(
                 "⚠️ **This codec is not web-browser supported.**\n"
                 "Convert to high-bitrate AAC to preserve channels?",
@@ -1331,11 +1342,11 @@ async def on_metadata_text(client: Client, message: Message) -> None:
 
     # Fast lookup: prompt message ID -> op_id.
     prompt_id = message.reply_to_message.id
-    matched_op_id = pending_metadata_prompts.get(prompt_id)
-    if matched_op_id is None:
+    op_id = pending_metadata_prompts.get(prompt_id)
+    if op_id is None:
         return
 
-    op = pending_ops.get(matched_op_id)
+    op = pending_ops.get(op_id)
     if op is None or op.get("chat_id") != message.chat.id:
         _clear_metadata_prompt(prompt_id)
         return
@@ -1345,7 +1356,7 @@ async def on_metadata_text(client: Client, message: Message) -> None:
     if stream_type is None:
         await message.reply("❌ **Metadata session expired. Please resend the file.**")
         _clear_metadata_prompt(prompt_id)
-        pending_ops.pop(matched_op_id, None)
+        pending_ops.pop(op_id, None)
         return
     track_list = (
         op["streams"]["audio"] if stream_type == "audio" else op["streams"]["subtitle"]
@@ -1362,7 +1373,7 @@ async def on_metadata_text(client: Client, message: Message) -> None:
         _clear_metadata_prompt(prompt_id)
         await _issue_metadata_prompt(
             reply_target=message,
-            op_id=matched_op_id,
+            op_id=op_id,
             op=op,
             track_idx=track_idx,
             stream_type=stream_type,
@@ -1375,7 +1386,7 @@ async def on_metadata_text(client: Client, message: Message) -> None:
         return
 
     # Remove the op from registry; we are executing the final mux now.
-    op = pending_ops.pop(matched_op_id)
+    op = pending_ops.pop(op_id)
     _clear_metadata_prompt(prompt_id)
 
     input_path: str = op.get("metadata_input_path") or op["input"]
