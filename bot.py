@@ -92,6 +92,7 @@ SUBTITLE_CODEC_EXTENSIONS = {
     "webvtt": ".vtt",
 }
 WEB_AUDIO_CODECS = {"aac", "mp3", "opus"}
+AAC_HIGH_BITRATE = "640k"
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -654,7 +655,7 @@ def _build_add_external_cmd(
             "-map", "1:a:0",
             "-c:v", "copy",
             "-c:a", "aac",
-            "-b:a", "640k",
+            "-b:a", AAC_HIGH_BITRATE,
             output_path,
         ]
     return [
@@ -760,6 +761,7 @@ async def _upload_post_add_result(
 )
 async def on_video(client: Client, message: Message) -> None:
     """Auto-detect MKV/MP4, download, probe, and present mux options."""
+    # Ignore replies meant for external-track uploads; handled elsewhere.
     if message.reply_to_message and message.reply_to_message.id in pending_external_prompts:
         return
     file_obj = message.video or message.document
@@ -1179,10 +1181,19 @@ async def on_callback(client: Client, query: CallbackQuery) -> None:
                     output_path,
                 ]
             else:
+                mode_map = {
+                    "convert": "convert",
+                    "isolate_audio": "isolate",
+                    "default_audio": "default",
+                }
+                ffmpeg_mode = mode_map.get(mode)
+                if ffmpeg_mode is None:
+                    await query.message.edit_text("❌ Unknown mux mode.")
+                    return
                 cmd = _build_ffmpeg_cmd(
                     input_path=input_path,
                     output_path=output_path,
-                    mode=mode.replace("_audio", ""),
+                    mode=ffmpeg_mode,
                     track_idx=selected_track_idx,
                 )
             if cmd is None:
