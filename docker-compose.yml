@@ -1,0 +1,9 @@
+services:
+  muxer:
+    build: .
+    container_name: tg-little-muxer
+    env_file:
+      - .env
+    volumes:
+      - ./downloads:/app/downloads
+    restart: unless-stopped
