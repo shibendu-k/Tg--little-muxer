@@ -335,6 +335,26 @@ async def _execute_mux(
     await status_msg.edit_text("✅ **Done! File uploaded.**", reply_markup=None)
 
 
+async def _issue_metadata_prompt(
+    reply_target: Message,
+    op_id: str,
+    op: dict,
+    track_idx: int,
+    prompt_text: str | None = None,
+) -> None:
+    """Send a ForceReply prompt and register the reply-to-op lookup."""
+    old_prompt_id = op.get("awaiting_metadata_msg_id")
+    if old_prompt_id:
+        pending_metadata_prompts.pop(old_prompt_id, None)
+    op["awaiting_metadata_for_track"] = track_idx
+    prompt = await reply_target.reply(
+        prompt_text or f"📝 **Send new title for Track {track_idx + 1}.**",
+        reply_markup=ForceReply(selective=True),
+    )
+    op["awaiting_metadata_msg_id"] = prompt.id
+    pending_metadata_prompts[prompt.id] = op_id
+
+
 # ── Message handler ───────────────────────────────────────────────────────────
 
 @app.on_message(
@@ -449,16 +469,12 @@ async def on_callback(client: Client, query: CallbackQuery) -> None:
             return
 
         # Remember which track is awaiting metadata so the reply handler can map it.
-        old_prompt_id = op.get("awaiting_metadata_msg_id")
-        if old_prompt_id:
-            pending_metadata_prompts.pop(old_prompt_id, None)
-        op["awaiting_metadata_for_track"] = track_idx
-        prompt = await query.message.reply(
-            f"📝 **Send new title for Track {track_idx + 1}.**",
-            reply_markup=ForceReply(selective=True),
+        await _issue_metadata_prompt(
+            reply_target=query.message,
+            op_id=op_id,
+            op=op,
+            track_idx=track_idx,
         )
-        op["awaiting_metadata_msg_id"] = prompt.id
-        pending_metadata_prompts[prompt.id] = op_id
         await query.answer("Waiting for new title…")
         return
 
@@ -520,7 +536,7 @@ async def on_callback(client: Client, query: CallbackQuery) -> None:
 
 # ── Metadata text reply handler ──────────────────────────────────────────────
 
-@app.on_message(filters.user(ADMIN_USER_ID) & filters.text)
+@app.on_message(filters.user(ADMIN_USER_ID) & filters.text & filters.reply)
 async def on_metadata_text(client: Client, message: Message) -> None:
     """Capture admin replies to metadata prompts and start muxing."""
     if not message.reply_to_message:
@@ -530,6 +546,7 @@ async def on_metadata_text(client: Client, message: Message) -> None:
     prompt_id = message.reply_to_message.id
     matched_op_id = pending_metadata_prompts.get(prompt_id)
     if matched_op_id is None:
+        pending_metadata_prompts.pop(prompt_id, None)
         return
 
     op = pending_ops.get(matched_op_id)
@@ -547,13 +564,16 @@ async def on_metadata_text(client: Client, message: Message) -> None:
     new_title = (message.text or "").strip()
     if not new_title:
         # Keep the op active and re-issue a fresh ForceReply prompt.
-        new_prompt = await message.reply(
-            f"❌ **Title cannot be empty. Send a name for Track {track_idx + 1}.**",
-            reply_markup=ForceReply(selective=True),
-        )
         pending_metadata_prompts.pop(prompt_id, None)
-        op["awaiting_metadata_msg_id"] = new_prompt.id
-        pending_metadata_prompts[new_prompt.id] = matched_op_id
+        await _issue_metadata_prompt(
+            reply_target=message,
+            op_id=matched_op_id,
+            op=op,
+            track_idx=track_idx,
+            prompt_text=(
+                f"❌ **Title cannot be empty. Send a name for Track {track_idx + 1}.**"
+            ),
+        )
         return
 
     # Remove the op from registry; we are executing the final mux now.
