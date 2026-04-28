@@ -19,14 +19,13 @@ Hosted on an Oracle ARM Free Tier server; performs **stream-copy only** (`-c cop
 
 ### Inline keyboard actions
 
-| Button | FFmpeg mapping |
-|---|---|
-| 🎬 Convert (Keep All Tracks) | `-map 0 -c copy` |
-| 🎵 Keep Track 1 Only (MP4) | `-map 0:v:0 -map 0:a:0 -c copy` |
-| 🎵 Keep Track 2 Only (MP4) | `-map 0:v:0 -map 0:a:1 -c copy` |
-| 🇮🇳 Set Track 2 as Default & Name it 'Hindi' | `-map 0:v:0 -map 0:a:1 -c copy -disposition:a:0 default -metadata:s:a:0 title=Hindi` |
-| ➕/➖/📤 Audio & Subtitle stubs | Interactive follow-up (stub, extensible) |
-| 🗑 Cancel & Delete | Removes the downloaded file immediately |
+| Menu | Button | FFmpeg mapping |
+|---|---|---|
+| Main | 🎬 Just Convert to MP4 | `-map 0 -c copy` |
+| Main → Isolate | 🎵 Track *N* | `-map 0:v:0 -map 0:a:{track_idx} -c copy` |
+| Main → Set Default | 🎵 Track *N* | `-map 0 -c copy -disposition:a 0 -disposition:a:{track_idx} default` |
+| Main → Edit Metadata | 🎵 Track *N* | `-map 0 -c copy -metadata:s:a:{track_idx} title="<new title>"` |
+| Main | 🗑 Cancel | Removes the downloaded file immediately |
 
 ---
 

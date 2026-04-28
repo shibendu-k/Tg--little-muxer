@@ -16,6 +16,7 @@ from dotenv import load_dotenv
 from pyrogram import Client, filters
 from pyrogram.types import (
     CallbackQuery,
+    ForceReply,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     Message,
@@ -44,7 +45,14 @@ app = Client(
 )
 
 # ── In-memory operation registry ─────────────────────────────────────────────
-# pending_ops[op_id] = {"input": str, "tracks": list[dict], "chat_id": int}
+# pending_ops[op_id] = {
+#   "input": str,
+#   "tracks": list[dict],
+#   "chat_id": int,
+#   "safe_name": str,
+#   "awaiting_metadata_for_track": int | None,
+#   "awaiting_metadata_msg_id": int | None,
+# }
 pending_ops: dict[str, dict] = {}
 _op_counter: int = 0
 
@@ -142,65 +150,168 @@ def _build_ffmpeg_cmd(
     input_path: str,
     output_path: str,
     mode: str,
+    track_idx: int = 0,
+    new_title: str | None = None,
 ) -> list | None:
-    """Build a stream-copy FFmpeg command for the given mode."""
+    """Build a stream-copy FFmpeg command for the given mode and track."""
     base = ["ffmpeg", "-y", "-i", input_path]
-    if mode == "all":
+
+    # Convert: keep all tracks, swap container to MP4.
+    if mode == "convert":
         return base + ["-map", "0", "-c", "copy", output_path]
-    if mode == "t1":
-        return base + ["-map", "0:v:0", "-map", "0:a:0", "-c", "copy", output_path]
-    if mode == "t2":
-        return base + ["-map", "0:v:0", "-map", "0:a:1", "-c", "copy", output_path]
-    if mode == "hindi":
+
+    # Isolate: keep video + only the selected audio track.
+    if mode == "isolate":
         return base + [
             "-map", "0:v:0",
-            "-map", "0:a:1",
+            "-map", f"0:a:{track_idx}",
             "-c", "copy",
-            "-disposition:a:0", "default",
-            "-metadata:s:a:0", "title=Hindi",
             output_path,
         ]
+
+    # Default: keep all tracks, set the selected audio as default.
+    if mode == "default":
+        return base + [
+            "-map", "0",
+            "-c", "copy",
+            "-disposition:a", "0",
+            f"-disposition:a:{track_idx}", "default",
+            output_path,
+        ]
+
+    # Metadata: keep all tracks, rename the selected audio track.
+    if mode == "metadata" and new_title is not None:
+        return base + [
+            "-map", "0",
+            "-c", "copy",
+            f"-metadata:s:a:{track_idx}", f"title={new_title}",
+            output_path,
+        ]
+
     return None
+
+
+# ── Dynamic track helpers ─────────────────────────────────────────────────────
+
+def _format_track_lines(tracks: list[dict]) -> str:
+    """Render a human-readable list of audio tracks for message text."""
+    return "\n".join(
+        f"  Track {i + 1}: `{t.get('codec_name', '?')}` | "
+        f"lang=`{t.get('tags', {}).get('language', 'und')}` | "
+        f"ch={t.get('channels', '?')}"
+        for i, t in enumerate(tracks)
+    ) or "  _(none detected)_"
+
+
+def _track_button_label(track_idx: int, track: dict) -> str:
+    """Build a friendly label for the inline track buttons."""
+    tags = track.get("tags", {}) or {}
+    language = (tags.get("language") or "und").title()
+    title = tags.get("title")
+    descriptor = f"{title} / {language}" if title else language
+    return f"🎵 Track {track_idx + 1} ({descriptor})"
+
+
+def _render_menu_text(safe_name: str, tracks: list[dict], menu: str) -> str:
+    """Build the main/sub-menu text block shown above the inline keyboard."""
+    prompt = {
+        "main": "Choose an action:",
+        "isolate": "Select the audio track to isolate:",
+        "default": "Select the audio track to set as default:",
+        "metadata": "Select the audio track to rename:",
+    }.get(menu, "Choose an action:")
+    track_lines = _format_track_lines(tracks)
+    return (
+        f"✅ **File ready!**\n\n"
+        f"📁 `{safe_name}`\n"
+        f"🎵 **Audio Tracks ({len(tracks)}):**\n{track_lines}\n\n"
+        f"{prompt}"
+    )
 
 
 # ── Inline keyboard ───────────────────────────────────────────────────────────
 
-def _build_keyboard(op_id: str, track_count: int) -> InlineKeyboardMarkup:
-    buttons: list[list[InlineKeyboardButton]] = [
-        [InlineKeyboardButton(
-            "🎬 Convert  (Keep All Tracks)",
-            callback_data=f"mux:all:{op_id}",
-        )],
-        [InlineKeyboardButton(
-            "🎵 Keep Track 1 Only (MP4)",
-            callback_data=f"mux:t1:{op_id}",
-        )],
-    ]
-    if track_count >= 2:
-        buttons += [
+def _build_dynamic_keyboard(
+    op_id: str,
+    tracks: list[dict],
+    menu: str = "main",
+) -> InlineKeyboardMarkup:
+    """Build a multi-level, track-driven inline keyboard."""
+    # Main menu: high-level actions only.
+    if menu == "main":
+        return InlineKeyboardMarkup(
+            [
+                [InlineKeyboardButton(
+                    "🎬 Just Convert to MP4",
+                    callback_data=f"mux:convert:{op_id}",
+                )],
+                [InlineKeyboardButton(
+                    "✂️ Isolate Audio",
+                    callback_data=f"menu:isolate:{op_id}",
+                )],
+                [InlineKeyboardButton(
+                    "⭐ Set Default Track",
+                    callback_data=f"menu:default:{op_id}",
+                )],
+                [InlineKeyboardButton(
+                    "📝 Edit Metadata",
+                    callback_data=f"menu:metadata:{op_id}",
+                )],
+                [InlineKeyboardButton(
+                    "🗑 Cancel",
+                    callback_data=f"cancel:{op_id}",
+                )],
+            ]
+        )
+
+    # Sub-menus: per-track selections for isolate/default/metadata.
+    if menu in {"isolate", "default", "metadata"}:
+        callback_prefix = "meta" if menu == "metadata" else f"mux:{menu}"
+        buttons = [
             [InlineKeyboardButton(
-                "🎵 Keep Track 2 Only (MP4)",
-                callback_data=f"mux:t2:{op_id}",
-            )],
-            [InlineKeyboardButton(
-                "🇮🇳 Set Track 2 as Default & Name it 'Hindi'",
-                callback_data=f"mux:hindi:{op_id}",
-            )],
+                _track_button_label(idx, track),
+                callback_data=f"{callback_prefix}:{idx}:{op_id}",
+            )]
+            for idx, track in enumerate(tracks)
         ]
-    buttons += [
-        [
-            InlineKeyboardButton("➕ Add Audio",     callback_data=f"stub:add_audio:{op_id}"),
-            InlineKeyboardButton("➖ Remove Audio",  callback_data=f"stub:rm_audio:{op_id}"),
-            InlineKeyboardButton("📤 Extract Audio", callback_data=f"stub:ext_audio:{op_id}"),
-        ],
-        [
-            InlineKeyboardButton("📝 Add Subtitle",     callback_data=f"stub:add_sub:{op_id}"),
-            InlineKeyboardButton("📝 Remove Subtitle",  callback_data=f"stub:rm_sub:{op_id}"),
-            InlineKeyboardButton("📤 Extract Subtitle", callback_data=f"stub:ext_sub:{op_id}"),
-        ],
-        [InlineKeyboardButton("🗑 Cancel & Delete", callback_data=f"cancel:{op_id}")],
-    ]
-    return InlineKeyboardMarkup(buttons)
+        buttons.append([
+            InlineKeyboardButton(
+                "🔙 Back to Main Menu",
+                callback_data=f"menu:main:{op_id}",
+            )
+        ])
+        return InlineKeyboardMarkup(buttons)
+
+    # Fallback: always show a safe main menu.
+    return _build_dynamic_keyboard(op_id, tracks, menu="main")
+
+
+async def _execute_mux(
+    client: Client,
+    status_msg: Message,
+    chat_id: int,
+    output_path: str,
+    cmd: list,
+) -> None:
+    """Run FFmpeg, upload the output, and keep the status message in sync."""
+    await status_msg.edit_text(
+        "⚙️ **Muxing (stream-copy, zero encoding)…**",
+        reply_markup=None,
+    )
+    ok, err = await _run_ffmpeg(cmd)
+    if not ok:
+        await status_msg.edit_text(f"❌ **FFmpeg failed.**\n```\n{err}\n```")
+        return
+
+    await status_msg.edit_text("⬆️ **Uploading…**")
+    await client.send_document(
+        chat_id=chat_id,
+        document=output_path,
+        caption="✅ **Muxing complete!**",
+        progress=_progress,
+        progress_args=(status_msg, "Uploading"),
+    )
+    await status_msg.edit_text("✅ **Done! File uploaded.**", reply_markup=None)
 
 
 # ── Message handler ───────────────────────────────────────────────────────────
@@ -246,26 +357,19 @@ async def on_video(client: Client, message: Message) -> None:
     await status_msg.edit_text("🔍 **Scanning audio tracks…**")
 
     tracks = await _ffprobe_audio(str(input_path))
-    track_lines = "\n".join(
-        f"  Track {i + 1}: `{t.get('codec_name', '?')}` | "
-        f"lang=`{t.get('tags', {}).get('language', 'und')}` | "
-        f"ch={t.get('channels', '?')}"
-        for i, t in enumerate(tracks)
-    ) or "  _(none detected)_"
-
     op_id = _next_op_id()
     pending_ops[op_id] = {
         "input": str(input_path),
         "tracks": tracks,
         "chat_id": message.chat.id,
+        "safe_name": safe_name,
+        "awaiting_metadata_for_track": None,
+        "awaiting_metadata_msg_id": None,
     }
 
     await status_msg.edit_text(
-        f"✅ **File ready!**\n\n"
-        f"📁 `{safe_name}`\n"
-        f"🎵 **Audio Tracks ({len(tracks)}):**\n{track_lines}\n\n"
-        f"Choose an action:",
-        reply_markup=_build_keyboard(op_id, len(tracks)),
+        _render_menu_text(safe_name, tracks, "main"),
+        reply_markup=_build_dynamic_keyboard(op_id, tracks, "main"),
     )
 
 
@@ -275,8 +379,8 @@ async def on_video(client: Client, message: Message) -> None:
 async def on_callback(client: Client, query: CallbackQuery) -> None:
     """Dispatch inline button presses."""
     data: str = query.data or ""
-    parts = data.split(":", 2)
-    action = parts[0]
+    parts = data.split(":")
+    action = parts[0] if parts else ""
 
     # ── Cancel ────────────────────────────────────────────────────────────────
     if action == "cancel" and len(parts) == 2:
@@ -290,60 +394,160 @@ async def on_callback(client: Client, query: CallbackQuery) -> None:
         await query.answer("Cancelled.")
         return
 
-    # ── Feature stubs (add/remove/extract) ───────────────────────────────────
-    if action == "stub" and len(parts) == 3:
-        await query.answer(
-            "This feature requires a follow-up file/message — coming soon.",
-            show_alert=True,
-        )
-        return
-
-    # ── Mux actions ───────────────────────────────────────────────────────────
-    if action == "mux" and len(parts) == 3:
-        _, mode, op_id = parts
-        op = pending_ops.pop(op_id, None)
+    # ── Menu navigation (no mux yet) ─────────────────────────────────────────
+    if action == "menu" and len(parts) == 3:
+        _, menu, op_id = parts
+        op = pending_ops.get(op_id)
         if op is None:
             await query.answer("Session expired. Please resend the file.", show_alert=True)
             return
+        await query.message.edit_text(
+            _render_menu_text(op["safe_name"], op["tracks"], menu),
+            reply_markup=_build_dynamic_keyboard(op_id, op["tracks"], menu),
+        )
+        await query.answer()
+        return
 
+    # ── Metadata track selection (await text reply) ──────────────────────────
+    if action == "meta" and len(parts) == 3:
+        _, track_str, op_id = parts
+        op = pending_ops.get(op_id)
+        if op is None:
+            await query.answer("Session expired. Please resend the file.", show_alert=True)
+            return
+        try:
+            track_idx = int(track_str)
+        except ValueError:
+            await query.answer("Invalid track selection.", show_alert=True)
+            return
+        if track_idx < 0 or track_idx >= len(op["tracks"]):
+            await query.answer("Track out of range.", show_alert=True)
+            return
+
+        # Remember which track is awaiting metadata so the reply handler can map it.
+        op["awaiting_metadata_for_track"] = track_idx
+        prompt = await query.message.reply(
+            f"📝 **Send new title for Track {track_idx + 1}.**",
+            reply_markup=ForceReply(selective=True),
+        )
+        op["awaiting_metadata_msg_id"] = prompt.id
+        await query.answer("Waiting for new title…")
+        return
+
+    # ── Mux actions (convert / isolate / default) ────────────────────────────
+    if action == "mux" and len(parts) in {3, 4}:
+        mode = parts[1]
+        op_id = parts[-1]
+        track_idx: int | None = None
+        if len(parts) == 4:
+            try:
+                track_idx = int(parts[2])
+            except ValueError:
+                await query.answer("Invalid track selection.", show_alert=True)
+                return
+
+        op = pending_ops.get(op_id)
+        if op is None:
+            await query.answer("Session expired. Please resend the file.", show_alert=True)
+            return
+        if mode in {"isolate", "default"}:
+            if track_idx is None or track_idx < 0 or track_idx >= len(op["tracks"]):
+                await query.answer("Track out of range.", show_alert=True)
+                return
+
+        # We are executing now, so remove the op from the registry.
+        op = pending_ops.pop(op_id)
         input_path: str = op["input"]
         chat_id: int = op["chat_id"]
         base_name = Path(input_path).stem
         output_path = str(DOWNLOADS_DIR / f"{base_name}_muxed.mp4")
 
-        await query.message.edit_text(
-            "⚙️ **Muxing (stream-copy, zero encoding)…**",
-            reply_markup=None,
-        )
-
         try:
-            cmd = _build_ffmpeg_cmd(input_path, output_path, mode)
+            cmd = _build_ffmpeg_cmd(
+                input_path=input_path,
+                output_path=output_path,
+                mode=mode,
+                track_idx=track_idx or 0,
+            )
             if cmd is None:
                 await query.message.edit_text("❌ Unknown mux mode.")
                 return
 
-            ok, err = await _run_ffmpeg(cmd)
-            if not ok:
-                await query.message.edit_text(
-                    f"❌ **FFmpeg failed.**\n```\n{err}\n```"
-                )
-                return
-
-            await query.message.edit_text("⬆️ **Uploading…**")
-            await client.send_document(
+            await _execute_mux(
+                client=client,
+                status_msg=query.message,
                 chat_id=chat_id,
-                document=output_path,
-                caption="✅ **Muxing complete!**",
-                progress=_progress,
-                progress_args=(query.message, "Uploading"),
+                output_path=output_path,
+                cmd=cmd,
             )
-            await query.message.edit_text("✅ **Done! File uploaded.**", reply_markup=None)
-
         finally:
             # Guaranteed cleanup regardless of success or failure
             _cleanup(input_path, output_path)
 
     await query.answer()
+
+
+# ── Metadata text reply handler ──────────────────────────────────────────────
+
+@app.on_message(filters.user(ADMIN_USER_ID) & filters.text)
+async def on_metadata_text(client: Client, message: Message) -> None:
+    """Capture admin replies to metadata prompts and start muxing."""
+    if not message.reply_to_message:
+        return
+
+    # Match this reply to the pending op that issued the ForceReply prompt.
+    matched_op_id: str | None = None
+    for op_id, op in pending_ops.items():
+        if (
+            op.get("awaiting_metadata_msg_id") == message.reply_to_message.id
+            and op.get("chat_id") == message.chat.id
+        ):
+            matched_op_id = op_id
+            break
+
+    if matched_op_id is None:
+        return
+
+    new_title = (message.text or "").strip()
+    if not new_title:
+        await message.reply("❌ **Title cannot be empty. Reply again with a name.**")
+        return
+
+    # Remove the op from registry; we are executing the final mux now.
+    op = pending_ops.pop(matched_op_id)
+    track_idx = op.get("awaiting_metadata_for_track")
+    if track_idx is None or track_idx < 0 or track_idx >= len(op["tracks"]):
+        await message.reply("❌ **Track selection expired. Please resend the file.**")
+        return
+
+    input_path: str = op["input"]
+    chat_id: int = op["chat_id"]
+    base_name = Path(input_path).stem
+    output_path = str(DOWNLOADS_DIR / f"{base_name}_muxed.mp4")
+
+    try:
+        cmd = _build_ffmpeg_cmd(
+            input_path=input_path,
+            output_path=output_path,
+            mode="metadata",
+            track_idx=track_idx,
+            new_title=new_title,
+        )
+        if cmd is None:
+            await message.reply("❌ **Failed to build FFmpeg command.**")
+            return
+
+        status_msg = await message.reply("⚙️ **Muxing (stream-copy, zero encoding)…**")
+        await _execute_mux(
+            client=client,
+            status_msg=status_msg,
+            chat_id=chat_id,
+            output_path=output_path,
+            cmd=cmd,
+        )
+    finally:
+        # Guaranteed cleanup regardless of success or failure
+        _cleanup(input_path, output_path)
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
