@@ -56,6 +56,39 @@ cp .env.example .env
 python bot.py
 ```
 
+---
+
+## Docker
+
+### Build & run
+
+```bash
+cp .env.example .env
+# edit .env with your values
+docker build -t tg-little-muxer .
+docker run --env-file .env \
+  --name tg-little-muxer \
+  --restart unless-stopped \
+  -v "$(pwd)/downloads:/app/downloads" \
+  tg-little-muxer
+```
+
+### Docker Compose
+
+```bash
+cp .env.example .env
+# edit .env with your values
+docker compose up -d --build
+```
+
+**Note:** `LOCAL_API_URL` must be reachable from inside the container.
+If your Bot API server runs on the host, use `http://host.docker.internal:8081`
+on Docker Desktop, or the host's LAN IP on Linux. If it runs in another
+container, point to that service name (e.g. `http://bot-api:8081`).
+
+These Docker assets are compatible with common hosting platforms that accept
+Docker images (Render, Railway, Fly.io, etc.).
+
 ### Environment variables (`.env`)
 
 | Variable | Description |
