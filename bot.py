@@ -47,8 +47,9 @@ SUBTITLE_CODEC_EXTENSIONS = {
 }
 # Commonly supported web audio codecs (HTML5 <audio> baseline support).
 WEB_COMPATIBLE_AUDIO_CODECS = {"aac", "mp3", "opus"}
-# High-bitrate AAC target for external-track conversion to preserve channels.
+# High-bitrate AAC target to preserve multichannel audio (e.g., 5.1/7.1).
 AAC_HIGH_BITRATE = "640k"
+MAX_METADATA_TITLE_LEN = 100
 
 MUX_MODE_MAP = {
     "convert": "convert",
@@ -254,7 +255,7 @@ def _parse_toggle_callback(parts: list[str]) -> tuple[str, str, int, str] | None
 def _sanitize_filename(name: str) -> str:
     """Ensure filenames do not start with '.' or '-' to avoid hidden/flagged names."""
     if name.startswith((".", "-")):
-        trimmed = name[1:] or "upload"
+        trimmed = name.lstrip(".-") or "upload"
         return f"file_{trimmed}"
     return name
 
@@ -334,7 +335,7 @@ def _format_video_tracks(tracks: list[dict]) -> str:
     ) or "  _(none detected)_"
 
 
-def _is_track_index_valid(track_idx: int | None, tracks: list[dict]) -> bool:
+def _is_track_index_in_range(track_idx: int | None, tracks: list[dict]) -> bool:
     """Validate that a selected index exists in a ffprobe track list."""
     return track_idx is not None and 0 <= track_idx < len(tracks)
 
@@ -530,7 +531,7 @@ def _build_dynamic_keyboard(
 
     # Multi-select extraction.
     if menu == "extract":
-        buttons: list[list[InlineKeyboardButton]] = []
+        buttons = []
         if streams["video"]:
             video_selected = "v:0" in op["selected_extract"]
             buttons.append([
@@ -805,7 +806,9 @@ async def on_video(client: Client, message: Message) -> None:
     """Auto-detect MKV/MP4, download, probe, and present mux options."""
     # Prevent external-track reply prompts from being treated as new video tasks.
     if message.reply_to_message and message.reply_to_message.id in pending_external_prompts:
-        await message.reply("❌ Please upload the external track as an audio/document file.")
+        await message.reply(
+            "❌ External track prompt active. Reply with an audio/document file, not a video."
+        )
         return
     file_obj = message.video or message.document
     if file_obj is None:
@@ -930,7 +933,7 @@ async def on_callback(client: Client, query: CallbackQuery) -> None:
             return
 
         if stream_key == "remove_audio":
-            if not _is_track_index_valid(track_idx, op["streams"]["audio"]):
+            if not _is_track_index_in_range(track_idx, op["streams"]["audio"]):
                 await query.answer("Track out of range.", show_alert=True)
                 return
             if track_idx in op["selected_audio"]:
@@ -938,7 +941,7 @@ async def on_callback(client: Client, query: CallbackQuery) -> None:
             else:
                 op["selected_audio"].add(track_idx)
         elif stream_key == "remove_subs":
-            if not _is_track_index_valid(track_idx, op["streams"]["subtitle"]):
+            if not _is_track_index_in_range(track_idx, op["streams"]["subtitle"]):
                 await query.answer("Track out of range.", show_alert=True)
                 return
             if track_idx in op["selected_subtitles"]:
@@ -950,10 +953,10 @@ async def on_callback(client: Client, query: CallbackQuery) -> None:
             if stream_key == "v" and not op["streams"]["video"]:
                 await query.answer("No video track found.", show_alert=True)
                 return
-            if stream_key == "a" and not _is_track_index_valid(track_idx, op["streams"]["audio"]):
+            if stream_key == "a" and not _is_track_index_in_range(track_idx, op["streams"]["audio"]):
                 await query.answer("Track out of range.", show_alert=True)
                 return
-            if stream_key == "s" and not _is_track_index_valid(track_idx, op["streams"]["subtitle"]):
+            if stream_key == "s" and not _is_track_index_in_range(track_idx, op["streams"]["subtitle"]):
                 await query.answer("Track out of range.", show_alert=True)
                 return
             if key in op["selected_extract"]:
@@ -1082,7 +1085,7 @@ async def on_callback(client: Client, query: CallbackQuery) -> None:
             await query.answer("Invalid track selection.", show_alert=True)
             return
         track_list = op["streams"]["audio"] if stream_type == "audio" else op["streams"]["subtitle"]
-        if not _is_track_index_valid(track_idx, track_list):
+        if not _is_track_index_in_range(track_idx, track_list):
             await query.answer("Track out of range.", show_alert=True)
             return
 
@@ -1186,7 +1189,7 @@ async def on_callback(client: Client, query: CallbackQuery) -> None:
             return
 
         if mode in {"isolate_audio", "default_audio"}:
-            if not _is_track_index_valid(selected_track_idx, op["streams"]["audio"]):
+            if not _is_track_index_in_range(selected_track_idx, op["streams"]["audio"]):
                 await query.answer("Track out of range.", show_alert=True)
                 return
 
@@ -1293,7 +1296,12 @@ async def on_external_upload(client: Client, message: Message) -> None:
             _cleanup(str(external_path))
             op["external_input_path"] = None
             return
-        codec_name = streams["audio"][0].get("codec_name", "")
+        codec_name = streams["audio"][0].get("codec_name")
+        if not codec_name:
+            await status_msg.edit_text("❌ Unable to detect audio codec. Please retry.")
+            _cleanup(str(external_path))
+            op["external_input_path"] = None
+            return
         op["external_codec"] = codec_name
         if codec_name.lower() not in WEB_COMPATIBLE_AUDIO_CODECS:
             await status_msg.edit_text(
@@ -1374,7 +1382,7 @@ async def on_metadata_text(client: Client, message: Message) -> None:
     track_list = (
         op["streams"]["audio"] if stream_type == "audio" else op["streams"]["subtitle"]
     )
-    if not _is_track_index_valid(track_idx, track_list):
+    if not _is_track_index_in_range(track_idx, track_list):
         await message.reply("❌ **Track selection expired. Please resend the file.**")
         _clear_metadata_prompt(prompt_id)
         pending_ops.pop(op_id, None)
@@ -1394,6 +1402,21 @@ async def on_metadata_text(client: Client, message: Message) -> None:
             output_path=op.get("metadata_output_path") or _output_path_for(op["input"], "metadata"),
             prompt_text=(
                 f"❌ **Title cannot be empty. Send a name for Track {track_idx + 1}.**"
+            ),
+        )
+        return
+    if len(new_title) > MAX_METADATA_TITLE_LEN:
+        _clear_metadata_prompt(prompt_id)
+        await _issue_metadata_prompt(
+            reply_target=message,
+            op_id=op_id,
+            op=op,
+            track_idx=track_idx,
+            stream_type=stream_type,
+            input_path=op.get("metadata_input_path") or op["input"],
+            output_path=op.get("metadata_output_path") or _output_path_for(op["input"], "metadata"),
+            prompt_text=(
+                f"❌ **Title too long. Max {MAX_METADATA_TITLE_LEN} characters.**"
             ),
         )
         return
