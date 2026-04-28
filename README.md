@@ -1,2 +1,81 @@
 # Tg--little-muxer
-a Telegram Bot  with sole purpose  to act as an ultra-lightweight 'FFmpeg Micro-Muxer'.
+
+An ultra-lightweight **FFmpeg Micro-Muxer** Telegram bot built with [Pyrogram](https://pyrogram.org/).  
+Hosted on an Oracle ARM Free Tier server; performs **stream-copy only** (`-c copy`) — zero CPU encoding load.
+
+---
+
+## Features
+
+| Feature | Detail |
+|---|---|
+| **Admin-only (Ghost Mode)** | Silent ignore for every non-admin user |
+| **Local Bot API** | Bypasses the 50 MB limit (up to 2 GB / 4 GB for Prime) |
+| **Auto-detection** | Recognises `.mkv` / `.mp4` sent as Video or Document |
+| **FFprobe scan** | Detects all audio tracks and displays codec, language, channels |
+| **Real-time progress** | Throttled progress bar while downloading and uploading |
+| **Stream-copy muxing** | Zero-encoding FFmpeg operations via inline keyboard |
+| **Guaranteed cleanup** | `try…finally` removes input + output files after every task |
+
+### Inline keyboard actions
+
+| Button | FFmpeg mapping |
+|---|---|
+| 🎬 Convert (Keep All Tracks) | `-map 0 -c copy` |
+| 🎵 Keep Track 1 Only (MP4) | `-map 0:v:0 -map 0:a:0 -c copy` |
+| 🎵 Keep Track 2 Only (MP4) | `-map 0:v:0 -map 0:a:1 -c copy` |
+| 🇮🇳 Set Track 2 as Default & Name it 'Hindi' | `-map 0:v:0 -map 0:a:1 -c copy -disposition:a:0 default -metadata:s:a:0 title=Hindi` |
+| ➕/➖/📤 Audio & Subtitle stubs | Interactive follow-up (stub, extensible) |
+| 🗑 Cancel & Delete | Removes the downloaded file immediately |
+
+---
+
+## Requirements
+
+- Python 3.9+
+- `ffmpeg` and `ffprobe` installed on the server
+- A running [Telegram Bot API server](https://github.com/tdlib/telegram-bot-api) (for large-file support)
+
+---
+
+## Quick start
+
+```bash
+# 1. Clone
+git clone https://github.com/shibendu-k/Tg--little-muxer.git
+cd Tg--little-muxer
+
+# 2. Install Python dependencies
+pip install -r requirements.txt
+
+# 3. Configure environment
+cp .env.example .env
+# Edit .env with your API_ID, API_HASH, BOT_TOKEN, LOCAL_API_URL, ADMIN_USER_ID
+
+# 4. Run
+python bot.py
+```
+
+### Environment variables (`.env`)
+
+| Variable | Description |
+|---|---|
+| `API_ID` | Telegram API ID from https://my.telegram.org/apps |
+| `API_HASH` | Telegram API hash |
+| `BOT_TOKEN` | Bot token from @BotFather |
+| `LOCAL_API_URL` | URL of your local Bot API server (default `http://localhost:8081`) |
+| `ADMIN_USER_ID` | Your numeric Telegram user ID — the **only** user the bot responds to |
+
+---
+
+## Privacy & Security
+
+- **Zero media logging** — file names, paths, and stream info are never written to the terminal.
+- **Admin-only filter** — all other users are silently ignored at the Pyrogram filter level.
+- **Disk cleanup** — both input and output files are deleted in a `finally` block after every operation, keeping the Oracle disk 100 % clean.
+
+---
+
+## License
+
+See [LICENSE](LICENSE).
