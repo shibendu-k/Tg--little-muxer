@@ -19,14 +19,18 @@ Hosted on an Oracle ARM Free Tier server; performs **stream-copy only** (`-c cop
 
 ### Inline keyboard actions
 
-| Button | FFmpeg mapping |
-|---|---|
-| 🎬 Convert (Keep All Tracks) | `-map 0 -c copy` |
-| 🎵 Keep Track 1 Only (MP4) | `-map 0:v:0 -map 0:a:0 -c copy` |
-| 🎵 Keep Track 2 Only (MP4) | `-map 0:v:0 -map 0:a:1 -c copy` |
-| 🇮🇳 Set Track 2 as Default & Name it 'Hindi' | `-map 0:v:0 -map 0:a:1 -c copy -disposition:a:0 default -metadata:s:a:0 title=Hindi` |
-| ➕/➖/📤 Audio & Subtitle stubs | Interactive follow-up (stub, extensible) |
-| 🗑 Cancel & Delete | Removes the downloaded file immediately |
+| Menu | Button | FFmpeg mapping |
+|---|---|---|
+| Main | 🎬 Just Convert to MP4 | `-map 0 -c copy` |
+| Main → Isolate Audio | 🎵 Track *N* | `-map 0:v:0 -map 0:a:{track_idx} -c copy` |
+| Main → Set Default Track | 🎵 Track *N* | `-map 0 -c copy -disposition:a 0 -disposition:a:{track_idx} default` |
+| Main → Edit Audio Metadata | 🎵 Track *N* | `-map 0 -c copy -metadata:s:a:{track_idx} title="<new title>"` |
+| Main → Remove Specific Audios | ✅ Execute Selected | `-map 0:v:0 -map 0:a:{keep_idx} -c copy` |
+| Main → Remove Specific Subtitles | ✅ Execute Selected | `-map 0:v:0 -map 0:s:{keep_idx} -c copy` |
+| Main | 🧹 Remove All Subtitles | `-map 0:v -map 0:a -c copy -sn` |
+| Main → Multi-Extract | ✅ Execute Selected | `-map 0:<type>:<idx> -c copy` |
+| Main → Add External Track | Convert/Keep + optional metadata edit | `-map 0 -map 1 -c copy` (+ optional AAC re-encode) |
+| Main | 🗑 Cancel | Removes the downloaded file immediately |
 
 ---
 
