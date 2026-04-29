@@ -1,7 +1,14 @@
-"""FFmpeg Micro-Muxer Telegram Bot.
+"""FFmpeg Micro-Muxer Telegram Bot — Production-Ready Enterprise Edition.
 
-A zero-encoding, stream-copy muxer bot powered by Pyrogram.
-Designed for an Oracle ARM Free Tier server.
+Implements:
+  • Multi-admin support via ADMIN_USER_IDS (comma-separated)
+  • Parallel 1 MiB chunk downloader with auto-resume (fast_download)
+  • Enhanced progress: live speed, ETA, and [Resuming…] indicator
+  • "Shopping Cart" batch processing — accumulate all changes, execute once
+  • Advanced metadata editing for Video / Audio / Subtitle (title + language)
+  • Attachment management (fonts, cover art) via FFmpeg -attach + -metadata:s:t
+  • Background file-retention loop + disk-space safety valve (< 10 % free)
+  • Upload retry with exponential back-off
 """
 from __future__ import annotations
 
@@ -9,11 +16,15 @@ import asyncio
 import json
 import math
 import os
+import shutil
 import time
 from pathlib import Path
 
+import aiofiles
 from dotenv import load_dotenv
 from pyrogram import Client, filters
+from pyrogram.raw import functions as raw_fns
+from pyrogram.raw import types as raw_types
 from pyrogram.types import (
     CallbackQuery,
     ForceReply,
@@ -24,14 +35,31 @@ from pyrogram.types import (
 
 load_dotenv()
 
-# ── Configuration (strict .env) ───────────────────────────────────────────────
+# ── Configuration ─────────────────────────────────────────────────────────────
 API_ID: int = int(os.environ["API_ID"])
 API_HASH: str = os.environ["API_HASH"]
 BOT_TOKEN: str = os.environ["BOT_TOKEN"]
 LOCAL_API_URL: str = os.environ.get("LOCAL_API_URL", "http://localhost:8081")
-ADMIN_USER_ID: int = int(os.environ["ADMIN_USER_ID"])
 
-# ── Codec/constants ───────────────────────────────────────────────────────────
+# Multiple admins: ADMIN_USER_IDS is a comma-separated string of numeric IDs.
+# Falls back to the legacy ADMIN_USER_ID key for backwards compatibility.
+_raw_admin_ids: str = (
+    os.environ.get("ADMIN_USER_IDS") or os.environ.get("ADMIN_USER_ID", "")
+)
+ADMIN_USER_IDS: list[int] = [
+    int(uid.strip()) for uid in _raw_admin_ids.split(",") if uid.strip().isdigit()
+]
+if not ADMIN_USER_IDS:
+    raise RuntimeError(
+        "Set ADMIN_USER_IDS (comma-separated integers) or ADMIN_USER_ID in .env"
+    )
+
+# How long to keep files in downloads/ before auto-deleting (minutes).
+FILE_RETENTION_MINUTES: int = int(os.environ.get("FILE_RETENTION_MINUTES", 480))
+# Disk-space safety threshold: aggressively delete if free space falls below this.
+_DISK_LOW_THRESHOLD: float = 0.10  # 10 %
+
+# ── Codec / constants ─────────────────────────────────────────────────────────
 
 AUDIO_CODEC_EXTENSIONS = {
     "eac3": ".eac3",
@@ -57,6 +85,17 @@ MUX_MODE_MAP = {
     "default_audio": "default",
 }
 
+# ── MIME types for MKV attachments (fonts and cover art) ─────────────────────
+ATTACHMENT_MIME_TYPES: dict[str, str] = {
+    ".ttf":  "application/x-truetype-font",
+    ".otf":  "application/x-font-otf",
+    ".woff": "font/woff",
+    ".woff2": "font/woff2",
+    ".jpg":  "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".png":  "image/png",
+}
+
 # ── Storage ───────────────────────────────────────────────────────────────────
 DOWNLOADS_DIR = Path("downloads")
 DOWNLOADS_DIR.mkdir(exist_ok=True)
@@ -76,12 +115,11 @@ app = Client(
 #   "streams": {"audio": list[dict], "subtitle": list[dict], "video": list[dict]},
 #   "chat_id": int,
 #   "safe_name": str,
-#   "selected_audio": set[int],
-#   "selected_subtitles": set[int],
-#   "selected_extract": set[str],  # "a:0", "s:1", "v:0"
+#   "selected_extract": set[str],             # "a:0", "s:1", "v:0"
 #   "awaiting_metadata_for_track": int | None,
 #   "awaiting_metadata_stream_type": str | None,
 #   "awaiting_metadata_msg_id": int | None,
+#   "awaiting_metadata_for_cart": bool,       # True → store in cart; False → exec now
 #   "metadata_input_path": str | None,
 #   "metadata_output_path": str | None,
 #   "awaiting_external_type": str | None,
@@ -91,16 +129,31 @@ app = Client(
 #   "post_add_output_path": str | None,
 #   "post_add_stream_type": str | None,
 #   "post_add_track_idx": int | None,
+#   "awaiting_attachment_msg_id": int | None,
+#   # ── Shopping cart ────────────────────────────────────────────────────────
+#   "cart": {
+#       "remove_audio": set[int],             # original audio track indices to drop
+#       "remove_subs":  set[int],             # original subtitle track indices to drop
+#       "metadata": dict[                     # keyed by (kind, orig_idx)
+#           tuple[str, int],
+#           dict[str, str],                   # {"title": ..., "language": ...}
+#       ],
+#       "attachments": list[dict],            # [{path, mimetype, filename}]
+#   },
 # }
 pending_ops: dict[str, dict] = {}
 # Reverse lookup: prompt message ID -> op_id (fast metadata reply matching).
 pending_metadata_prompts: dict[int, str] = {}
 # Reverse lookup: external upload prompt message ID -> op_id.
 pending_external_prompts: dict[int, str] = {}
+# Reverse lookup: attachment upload prompt message ID -> op_id.
+pending_attachment_prompts: dict[int, str] = {}
 _op_counter: int = 0
 
 # Progress-bar throttle: msg_id → last_update_monotonic
 _progress_ts: dict[int, float] = {}
+# Per-message speed tracking: msg_id → {start_time, start_bytes}
+_progress_speed_data: dict[int, dict] = {}
 _PROGRESS_INTERVAL = 2.0  # seconds between edits
 
 
@@ -128,19 +181,106 @@ def _human_size(n: int) -> str:
     return f"{n / (1024 ** i):.2f} {units[i]}"
 
 
-async def _progress(current: int, total: int, msg: Message, label: str) -> None:
-    """Throttled progress bar editor."""
+def _format_eta(secs: float) -> str:
+    """Format a duration in seconds as a human-readable ETA string."""
+    if secs <= 0 or not math.isfinite(secs):
+        return "—"
+    m, s = divmod(int(secs), 60)
+    h, m = divmod(m, 60)
+    if h > 0:
+        return f"{h}h {m}m {s}s"
+    if m > 0:
+        return f"{m}m {s}s"
+    return f"{s}s"
+
+
+async def _progress(
+    current: int,
+    total: int,
+    msg: Message,
+    label: str,
+    start_time: float | None = None,
+    start_bytes: int = 0,
+    is_resuming: bool = False,
+) -> None:
+    """Throttled progress bar with live speed (MiB/s), ETA and resume indicator.
+
+    When *start_time* is provided the function computes:
+      • 🚀 Speed  — bytes transferred this session / elapsed seconds
+      • ⏳ ETA    — remaining bytes / current speed
+    A ``[Resuming…]`` badge is shown when *is_resuming* is True.
+    """
     now = time.monotonic()
     if current < total and now - _progress_ts.get(msg.id, 0) < _PROGRESS_INTERVAL:
         return
     _progress_ts[msg.id] = now
+
+    # Speed / ETA calculation (only when the caller supplies start_time).
+    speed_str = ""
+    eta_str = ""
+    if start_time is not None:
+        if msg.id not in _progress_speed_data:
+            _progress_speed_data[msg.id] = {
+                "start_time": start_time,
+                "start_bytes": start_bytes,
+            }
+        data = _progress_speed_data[msg.id]
+        elapsed = now - data["start_time"]
+        transferred = current - data["start_bytes"]
+        speed = transferred / elapsed if elapsed > 0 else 0.0
+        remaining = total - current
+        eta = remaining / speed if speed > 0 else 0.0
+        speed_str = f"🚀 {_human_size(int(speed))}/s"
+        eta_str = f"⏳ ETA: {_format_eta(eta)}"
+
+    resume_tag = " `[Resuming…]`" if is_resuming else ""
+    extras = f"\n{speed_str}  {eta_str}".strip() if (speed_str or eta_str) else ""
+
     try:
         await msg.edit_text(
-            f"**{label}…**\n{_make_bar(current, total)}\n"
-            f"{_human_size(current)} / {_human_size(total)}"
+            f"**{label}…{resume_tag}**\n"
+            f"📊 {_make_bar(current, total)}\n"
+            f"📦 {_human_size(current)} / {_human_size(total)}"
+            f"{extras}"
         )
     except Exception:
         pass
+
+    if current >= total:
+        _progress_ts.pop(msg.id, None)
+        _progress_speed_data.pop(msg.id, None)
+
+
+def _attachment_mimetype(filename: str) -> str:
+    """Return the MIME type string for an attachment, based on file extension."""
+    ext = Path(filename).suffix.lower()
+    return ATTACHMENT_MIME_TYPES.get(ext, "application/octet-stream")
+
+
+def _cart_has_changes(op: dict) -> bool:
+    """Return True when the shopping cart holds at least one pending operation."""
+    cart = op.get("cart", {})
+    return bool(
+        cart.get("remove_audio")
+        or cart.get("remove_subs")
+        or cart.get("metadata")
+        or cart.get("attachments")
+    )
+
+
+def _cart_summary_lines(op: dict) -> list[str]:
+    """Return a list of human-readable lines describing the current cart state."""
+    cart = op.get("cart", {})
+    lines: list[str] = []
+    if cart.get("remove_audio"):
+        lines.append(f"🗑 Remove {len(cart['remove_audio'])} audio track(s)")
+    if cart.get("remove_subs"):
+        lines.append(f"🗑 Remove {len(cart['remove_subs'])} subtitle track(s)")
+    if cart.get("metadata"):
+        lines.append(f"✏️ Metadata edits queued for {len(cart['metadata'])} track(s)")
+    if cart.get("attachments"):
+        lines.append(f"📎 {len(cart['attachments'])} attachment(s) pending")
+    return lines
 
 
 def _cleanup(*paths: str) -> None:
@@ -151,6 +291,59 @@ def _cleanup(*paths: str) -> None:
                 os.remove(p)
         except OSError:
             pass
+
+
+# ── Background file-retention loop ────────────────────────────────────────────
+
+async def _cleanup_loop() -> None:
+    """Enforce file retention policy in the background.
+
+    Runs every 60 seconds:
+
+    1. **Normal mode** — delete files older than ``FILE_RETENTION_MINUTES``.
+    2. **Safety valve** — if free disk space drops below ``_DISK_LOW_THRESHOLD``
+       (10 %) delete the *oldest* files first until space is recovered.  This
+       prevents OS crashes on constrained servers.
+    """
+    while True:
+        await asyncio.sleep(60)
+        try:
+            cutoff = time.time() - FILE_RETENTION_MINUTES * 60
+
+            # Collect files with mtime, oldest first.
+            entries: list[tuple[float, Path]] = []
+            for entry in DOWNLOADS_DIR.iterdir():
+                if entry.is_file():
+                    try:
+                        entries.append((entry.stat().st_mtime, entry))
+                    except OSError:
+                        pass
+            entries.sort()  # ascending mtime → oldest first
+
+            disk = shutil.disk_usage(DOWNLOADS_DIR)
+            free_ratio = disk.free / disk.total if disk.total else 1.0
+
+            if free_ratio < _DISK_LOW_THRESHOLD:
+                # Aggressive mode: purge oldest files until breathing room restored.
+                for _mtime, path in entries:
+                    if free_ratio >= _DISK_LOW_THRESHOLD:
+                        break
+                    try:
+                        path.unlink(missing_ok=True)
+                        disk = shutil.disk_usage(DOWNLOADS_DIR)
+                        free_ratio = disk.free / disk.total if disk.total else 1.0
+                    except OSError:
+                        pass
+            else:
+                # Normal retention: remove files past the cutoff time.
+                for mtime, path in entries:
+                    if mtime < cutoff:
+                        try:
+                            path.unlink(missing_ok=True)
+                        except OSError:
+                            pass
+        except Exception:
+            pass  # Never let a background loop crash the bot.
 
 
 # ── FFprobe / FFmpeg (async, non-blocking) ────────────────────────────────────
@@ -222,10 +415,204 @@ def _video_container_extension(input_path: str) -> str:
     return ".mp4" if Path(input_path).suffix.lower() == ".mp4" else ".mkv"
 
 
-def _output_path_for(input_path: str, suffix: str, ext: str = ".mp4") -> str:
+def _output_path_for(input_path: str, suffix: str, ext: str = ".mkv") -> str:
     """Build an output path in the downloads directory."""
     base_name = Path(input_path).stem
     return str(DOWNLOADS_DIR / f"{base_name}_{suffix}{ext}")
+
+
+# ── Fast parallel downloader with auto-resume ─────────────────────────────────
+
+async def _fallback_download(
+    client: Client,
+    message: Message,
+    file_path: Path,
+    status_msg: Message,
+    label: str,
+) -> bool:
+    """High-level download_media fallback (no parallelism, no raw-API)."""
+    start_time = time.monotonic()
+    try:
+        await client.download_media(
+            message,
+            file_name=str(file_path),
+            progress=_progress,
+            progress_args=(status_msg, label, start_time, 0, False),
+        )
+        return True
+    except Exception:
+        return False
+
+
+async def fast_download(
+    client: Client,
+    message: Message,
+    file_path: Path,
+    status_msg: Message,
+    label: str,
+) -> bool:
+    """Download *message* to *file_path* using parallel 1 MiB raw-API chunks.
+
+    Auto-resume:
+        If *file_path* already exists its byte count is floored to the last
+        complete 1 MiB boundary.  Only the missing chunks from that boundary
+        onward are fetched, so a bot restart transparently picks up where it
+        left off.
+
+    Concurrency:
+        Up to 10 ``GetFile`` requests run simultaneously behind an
+        ``asyncio.Semaphore(10)``.  ``asyncio.gather`` preserves submission
+        order, so chunks are written sequentially without seeking.
+
+    Fallback:
+        Any raw-API error (DC mismatch, CDN redirect, file-reference expiry,
+        …) is caught; the partial file is removed and
+        ``_fallback_download`` (Pyrogram's built-in ``download_media``) is
+        used instead.
+    """
+    file_obj = message.video or message.document
+    if not file_obj:
+        return False
+
+    total_size: int = file_obj.file_size or 0
+    if total_size == 0:
+        return await _fallback_download(client, message, file_path, status_msg, label)
+
+    CHUNK_SIZE = 1024 * 1024  # 1 MiB per request
+
+    # ── Auto-resume: find the last complete 1 MiB boundary on disk ───────────
+    existing_size = file_path.stat().st_size if file_path.exists() else 0
+    if existing_size >= total_size:
+        return True  # Already fully downloaded.
+
+    start_offset = (existing_size // CHUNK_SIZE) * CHUNK_SIZE
+    is_resuming = start_offset > 0
+
+    # Truncate any incomplete trailing chunk so "ab" appends from a clean edge.
+    if file_path.exists() and existing_size > start_offset:
+        os.truncate(str(file_path), start_offset)
+    elif not file_path.exists():
+        start_offset = 0
+        is_resuming = False
+
+    # ── Decode the raw InputDocumentFileLocation ──────────────────────────────
+    # We only need InputDocumentFileLocation because this bot deals exclusively
+    # with video/document messages (not bare photos).
+    try:
+        from pyrogram.file_id import FileId  # type: ignore[import]
+        fid = FileId.decode(file_obj.file_id)
+        location: raw_types.InputDocumentFileLocation = (
+            raw_types.InputDocumentFileLocation(
+                id=fid.media_id,
+                access_hash=fid.access_hash,
+                file_reference=fid.file_reference,
+                thumb_size="",
+            )
+        )
+    except Exception:
+        # Cannot decode file_id → use high-level fallback.
+        return await _fallback_download(client, message, file_path, status_msg, label)
+
+    total_chunks = math.ceil(total_size / CHUNK_SIZE)
+    start_chunk = start_offset // CHUNK_SIZE
+    sem = asyncio.Semaphore(10)
+    start_time = time.monotonic()
+    downloaded_this_session = 0
+
+    async def _fetch(chunk_idx: int) -> tuple[int, bytes]:
+        offset = chunk_idx * CHUNK_SIZE
+        async with sem:
+            result = await client.invoke(
+                raw_fns.upload.GetFile(
+                    location=location,
+                    offset=offset,
+                    limit=CHUNK_SIZE,
+                    precise=True,
+                )
+            )
+            if not hasattr(result, "bytes"):
+                # CDN redirect or unknown result type → bail out.
+                raise ValueError(
+                    f"Unexpected GetFile result type: {type(result).__name__}"
+                )
+            return chunk_idx, result.bytes
+
+    BATCH = 10  # max concurrent requests per gather call
+    try:
+        open_mode = "ab" if is_resuming else "wb"
+        async with aiofiles.open(file_path, open_mode) as fh:
+            for batch_start in range(start_chunk, total_chunks, BATCH):
+                batch_end = min(batch_start + BATCH, total_chunks)
+                # asyncio.gather returns results in submission order → safe to
+                # write sequentially without seeking.
+                results: list[tuple[int, bytes]] = await asyncio.gather(
+                    *[_fetch(i) for i in range(batch_start, batch_end)]
+                )
+                for _idx, data in results:
+                    await fh.write(data)
+                    downloaded_this_session += len(data)
+                await _progress(
+                    start_offset + downloaded_this_session,
+                    total_size,
+                    status_msg,
+                    label,
+                    start_time=start_time,
+                    start_bytes=start_offset,
+                    is_resuming=is_resuming,
+                )
+        return True
+    except Exception:
+        # Clean up the partial file so a retry starts fresh.
+        if file_path.exists():
+            try:
+                os.remove(str(file_path))
+            except OSError:
+                pass
+        return await _fallback_download(client, message, file_path, status_msg, label)
+
+
+# ── Upload with retry ─────────────────────────────────────────────────────────
+
+async def _upload_with_retry(
+    client: Client,
+    chat_id: int,
+    file_path: str,
+    caption: str,
+    status_msg: Message,
+    max_retries: int = 3,
+) -> None:
+    """Upload *file_path* to *chat_id* with exponential-back-off retries.
+
+    Pyrogram handles low-level chunked uploads internally.  This wrapper adds
+    application-level retry logic for transient network drops.  Raises the
+    last exception if all attempts are exhausted.
+    """
+    last_exc: Exception | None = None
+    for attempt in range(max_retries):
+        if attempt > 0:
+            wait = 5 * attempt
+            try:
+                await status_msg.edit_text(
+                    f"⬆️ **Uploading… (retry {attempt}/{max_retries - 1}, "
+                    f"waiting {wait}s)**"
+                )
+            except Exception:
+                pass
+            await asyncio.sleep(wait)
+        start_time = time.monotonic()
+        try:
+            await client.send_document(
+                chat_id=chat_id,
+                document=file_path,
+                caption=caption,
+                progress=_progress,
+                progress_args=(status_msg, "Uploading", start_time, 0, False),
+            )
+            return  # Success — exit immediately.
+        except Exception as exc:
+            last_exc = exc
+
+    raise last_exc  # type: ignore[misc]
 
 
 def _parse_toggle_callback(parts: list[str]) -> tuple[str, str, int, str] | None:
@@ -259,6 +646,7 @@ def _sanitize_filename(name: str) -> str:
         return f"file_{trimmed}"
     return name
 
+
 def _build_ffmpeg_cmd(
     input_path: str,
     output_path: str,
@@ -267,10 +655,10 @@ def _build_ffmpeg_cmd(
     new_title: str | None = None,
     stream_type: str = "audio",
 ) -> list | None:
-    """Build a stream-copy FFmpeg command for the given mode and track."""
+    """Build a stream-copy FFmpeg command for single-purpose (immediate) modes."""
     base = ["ffmpeg", "-y", "-i", input_path]
 
-    # Convert: keep all tracks, swap container to MP4.
+    # Convert: keep all tracks, swap container.
     if mode == "convert":
         return base + ["-map", "0", "-c", "copy", output_path]
 
@@ -293,7 +681,7 @@ def _build_ffmpeg_cmd(
             output_path,
         ]
 
-    # Metadata: keep all tracks, rename the selected audio track.
+    # Metadata (immediate / post-add): keep all tracks, rename one track.
     if mode == "metadata" and track_idx is not None and new_title is not None:
         stream_selector = "a" if stream_type == "audio" else "s"
         return base + [
@@ -304,6 +692,97 @@ def _build_ffmpeg_cmd(
         ]
 
     return None
+
+
+def _build_cart_ffmpeg_cmd(
+    input_path: str,
+    output_path: str,
+    op: dict,
+) -> list[str]:
+    """Compile ALL pending cart operations into a single FFmpeg stream-copy command.
+
+    ── MAP INDEX SHIFTING ────────────────────────────────────────────────────────
+    FFmpeg's ``-metadata:s:TYPE:N`` flag references OUTPUT stream indices
+    (0-based per stream type), not input indices.  When tracks are removed, the
+    output indices shift.  Example:
+
+        Input audio:  [a0, a1, a2, a3]
+        Cart removal: {a1, a3}
+        Output audio: [a0 → out:a:0,  a2 → out:a:1]
+
+    We therefore:
+      1. Build ``audio_keep`` / ``sub_keep`` (original indices in ascending order).
+      2. Map original → output index via ``enumerate(audio_keep)``.
+      3. Emit ``-metadata:s:a:OUTPUT_IDX`` (not the original index).
+
+    This guarantees zero collision between -map arguments and metadata flags
+    regardless of which or how many tracks are removed.
+    ─────────────────────────────────────────────────────────────────────────────
+    """
+    streams = op["streams"]
+    cart = op.get("cart", {})
+
+    remove_audio: set[int] = cart.get("remove_audio", set())
+    remove_subs: set[int] = cart.get("remove_subs", set())
+    # cart["metadata"] keys are (kind, orig_idx), values are {title, language}
+    track_metadata: dict = cart.get("metadata", {})
+    attachments: list[dict] = cart.get("attachments", [])
+
+    # ── Build lists of kept original indices (ascending) ─────────────────────
+    audio_keep = [i for i in range(len(streams["audio"])) if i not in remove_audio]
+    sub_keep   = [i for i in range(len(streams["subtitle"])) if i not in remove_subs]
+    has_video  = bool(streams["video"])
+
+    # ── Build original → output index maps ───────────────────────────────────
+    # audio_out_map[original_input_idx] = output_audio_stream_idx
+    audio_out_map: dict[int, int] = {orig: out for out, orig in enumerate(audio_keep)}
+    sub_out_map:   dict[int, int] = {orig: out for out, orig in enumerate(sub_keep)}
+    # Video is always kept at v:0 (multiple-video-track removal not supported).
+
+    # ── Assemble the command ──────────────────────────────────────────────────
+    cmd: list[str] = ["ffmpeg", "-y", "-i", input_path]
+
+    # ── Stream mapping ────────────────────────────────────────────────────────
+    if has_video:
+        cmd += ["-map", "0:v:0"]
+    for orig_idx in audio_keep:
+        cmd += ["-map", f"0:a:{orig_idx}"]
+    for orig_idx in sub_keep:
+        cmd += ["-map", f"0:s:{orig_idx}"]
+
+    # ── Global stream copy (no re-encoding) ──────────────────────────────────
+    cmd += ["-c", "copy"]
+
+    # ── Per-stream metadata (using OUTPUT indices after removal shift) ────────
+    for (kind, orig_idx), meta in track_metadata.items():
+        if kind == "video" and has_video:
+            # Video is not removed, output index is always 0.
+            out_sel = "v:0"
+        elif kind == "audio":
+            if orig_idx not in audio_out_map:
+                continue  # This track was removed; skip its metadata.
+            out_sel = f"a:{audio_out_map[orig_idx]}"
+        elif kind == "subtitle":
+            if orig_idx not in sub_out_map:
+                continue  # This track was removed; skip its metadata.
+            out_sel = f"s:{sub_out_map[orig_idx]}"
+        else:
+            continue
+
+        title = meta.get("title", "")
+        lang  = meta.get("language", "")
+        if title:
+            cmd += [f"-metadata:s:{out_sel}", f"title={title}"]
+        if lang:
+            cmd += [f"-metadata:s:{out_sel}", f"language={lang}"]
+
+    # ── Attachments (-attach requires MKV output container) ──────────────────
+    for att_idx, att in enumerate(attachments):
+        cmd += ["-attach", att["path"]]
+        cmd += [f"-metadata:s:t:{att_idx}", f"mimetype={att['mimetype']}"]
+
+    cmd.append(output_path)
+    return cmd
 
 
 # ── Dynamic track helpers ─────────────────────────────────────────────────────
@@ -375,22 +854,41 @@ def _video_button_label(track: dict) -> str:
     return f"🎬 Video ({codec})"
 
 
-def _render_menu_text(safe_name: str, streams: dict[str, list[dict]], menu: str) -> str:
-    """Build the main/sub-menu text block shown above the inline keyboard."""
+def _clear_attachment_prompt(prompt_id: int | None) -> None:
+    """Remove a tracked attachment upload prompt safely."""
+    if prompt_id is not None:
+        pending_attachment_prompts.pop(prompt_id, None)
+
+
+def _render_menu_text(
+    safe_name: str,
+    streams: dict[str, list[dict]],
+    menu: str,
+    op: dict | None = None,
+) -> str:
+    """Build the main/sub-menu text block shown above the inline keyboard.
+
+    When *op* is provided, a cart-summary block is appended to the main menu
+    so the user can see what pending changes are queued before executing.
+    """
     prompt = {
-        "main": "Choose an action:",
-        "isolate_audio": "Select the audio track to isolate:",
-        "default_audio": "Select the audio track to set as default:",
-        "metadata_audio": "Select the audio track to rename:",
-        "remove_audio": "Toggle audio tracks to remove, then execute:",
-        "remove_subs": "Toggle subtitle tracks to remove, then execute:",
-        "extract": "Toggle tracks to extract, then execute:",
-        "add_external": "Choose which external track to add:",
+        "main":             "Choose an action:",
+        "isolate_audio":    "Select the audio track to isolate:",
+        "default_audio":    "Select the audio track to set as default:",
+        "metadata_audio":   "Select the audio track to edit metadata:",
+        "metadata_subtitle":"Select the subtitle track to edit metadata:",
+        "metadata_video":   "Select the video track to edit metadata:",
+        "remove_audio":     "Toggle audio tracks to remove, then confirm:",
+        "remove_subs":      "Toggle subtitle tracks to remove, then confirm:",
+        "extract":          "Toggle tracks to extract, then execute:",
+        "add_external":     "Choose which external track to add:",
+        "manage_attachments": "Manage attachments (fonts / cover art):",
     }.get(menu, "Choose an action:")
-    audio_lines = _format_audio_tracks(streams["audio"])
+
+    audio_lines    = _format_audio_tracks(streams["audio"])
     subtitle_lines = _format_subtitle_tracks(streams["subtitle"])
-    video_lines = _format_video_tracks(streams["video"])
-    return (
+    video_lines    = _format_video_tracks(streams["video"])
+    base = (
         f"✅ **File ready!**\n\n"
         f"📁 `{safe_name}`\n"
         f"🎬 **Video Tracks ({len(streams['video'])}):**\n{video_lines}\n\n"
@@ -398,6 +896,14 @@ def _render_menu_text(safe_name: str, streams: dict[str, list[dict]], menu: str)
         f"📝 **Subtitle Tracks ({len(streams['subtitle'])}):**\n{subtitle_lines}\n\n"
         f"{prompt}"
     )
+
+    # Show cart summary in the main menu when changes are pending.
+    if menu == "main" and op and _cart_has_changes(op):
+        lines = _cart_summary_lines(op)
+        cart_block = "\n".join(f"  • {l}" for l in lines)
+        base += f"\n\n🛒 **Pending cart changes:**\n{cart_block}"
+
+    return base
 
 
 # ── Inline keyboard ───────────────────────────────────────────────────────────
@@ -409,6 +915,7 @@ def _build_dynamic_keyboard(
 ) -> InlineKeyboardMarkup:
     """Build a multi-level, track-driven inline keyboard."""
     streams = op["streams"]
+    cart = op.get("cart", {})
 
     def _toggle_label(label: str, selected: bool) -> str:
         return f"✅ {label}" if selected else label
@@ -416,56 +923,83 @@ def _build_dynamic_keyboard(
     def _no_tracks_row(label: str) -> list[InlineKeyboardButton]:
         return [InlineKeyboardButton(label, callback_data="noop")]
 
-    # Main menu: high-level actions only.
+    # ── Main menu ─────────────────────────────────────────────────────────────
     if menu == "main":
-        return InlineKeyboardMarkup(
-            [
-                [InlineKeyboardButton(
-                    "🎬 Just Convert to MP4",
-                    callback_data=f"mux:convert:{op_id}",
-                )],
-                [InlineKeyboardButton(
-                    "✂️ Isolate Audio",
-                    callback_data=f"menu:isolate_audio:{op_id}",
-                )],
-                [InlineKeyboardButton(
-                    "⭐ Set Default Track",
-                    callback_data=f"menu:default_audio:{op_id}",
-                )],
-                [InlineKeyboardButton(
-                    "📝 Edit Audio Metadata",
-                    callback_data=f"menu:metadata_audio:{op_id}",
-                )],
-                [InlineKeyboardButton(
-                    "🧹 Remove Specific Audios",
-                    callback_data=f"menu:remove_audio:{op_id}",
-                )],
-                [InlineKeyboardButton(
-                    "🧹 Remove Specific Subtitles",
-                    callback_data=f"menu:remove_subs:{op_id}",
-                )],
-                [InlineKeyboardButton(
-                    "🧹 Remove All Subtitles",
-                    callback_data=f"mux:remove_all_subs:{op_id}",
-                )],
-                [InlineKeyboardButton(
-                    "📤 Multi-Extract Tracks",
-                    callback_data=f"menu:extract:{op_id}",
-                )],
-                [InlineKeyboardButton(
-                    "➕ Add External Track",
-                    callback_data=f"menu:add_external:{op_id}",
-                )],
-                [InlineKeyboardButton(
-                    "🗑 Cancel",
-                    callback_data=f"cancel:{op_id}",
-                )],
-            ]
-        )
+        rows: list[list[InlineKeyboardButton]] = [
+            [InlineKeyboardButton(
+                "🎬 Just Convert to MKV/MP4",
+                callback_data=f"mux:convert:{op_id}",
+            )],
+            [InlineKeyboardButton(
+                "✂️ Isolate Audio",
+                callback_data=f"menu:isolate_audio:{op_id}",
+            )],
+            [InlineKeyboardButton(
+                "⭐ Set Default Audio Track",
+                callback_data=f"menu:default_audio:{op_id}",
+            )],
+            [InlineKeyboardButton(
+                "✏️ Edit Audio Metadata",
+                callback_data=f"menu:metadata_audio:{op_id}",
+            )],
+            [InlineKeyboardButton(
+                "✏️ Edit Subtitle Metadata",
+                callback_data=f"menu:metadata_subtitle:{op_id}",
+            )],
+        ]
+        # Show video metadata only when a video track exists.
+        if streams["video"]:
+            rows.append([InlineKeyboardButton(
+                "✏️ Edit Video Metadata",
+                callback_data=f"menu:metadata_video:{op_id}",
+            )])
+        rows += [
+            [InlineKeyboardButton(
+                "🧹 Remove Specific Audio Tracks",
+                callback_data=f"menu:remove_audio:{op_id}",
+            )],
+            [InlineKeyboardButton(
+                "🧹 Remove Specific Subtitle Tracks",
+                callback_data=f"menu:remove_subs:{op_id}",
+            )],
+            [InlineKeyboardButton(
+                "🧹 Remove All Subtitles (immediate)",
+                callback_data=f"mux:remove_all_subs:{op_id}",
+            )],
+            [InlineKeyboardButton(
+                "📤 Multi-Extract Tracks",
+                callback_data=f"menu:extract:{op_id}",
+            )],
+            [InlineKeyboardButton(
+                "➕ Add External Track",
+                callback_data=f"menu:add_external:{op_id}",
+            )],
+            [InlineKeyboardButton(
+                "📎 Manage Attachments",
+                callback_data=f"menu:manage_attachments:{op_id}",
+            )],
+        ]
+        # Show the Execute-All button only when the cart has pending changes.
+        if _cart_has_changes(op):
+            rows.append([InlineKeyboardButton(
+                "🚀 Execute All Changes",
+                callback_data=f"cart_exec:{op_id}",
+            )])
+            rows.append([InlineKeyboardButton(
+                "🗑 Clear Cart",
+                callback_data=f"cart_clear:{op_id}",
+            )])
+        rows.append([InlineKeyboardButton(
+            "🗑 Cancel",
+            callback_data=f"cancel:{op_id}",
+        )])
+        return InlineKeyboardMarkup(rows)
 
-    # Sub-menus: per-track selections for isolate/default/metadata (single select).
+    # ── Sub-menus: per-track single selection (isolate / default / metadata) ──
     if menu in {"isolate_audio", "default_audio", "metadata_audio"}:
-        callback_prefix = "meta:audio" if menu == "metadata_audio" else f"mux:{menu}"
+        callback_prefix = (
+            "meta:audio" if menu == "metadata_audio" else f"mux:{menu}"
+        )
         buttons = [
             [InlineKeyboardButton(
                 _track_button_label(idx, track),
@@ -473,21 +1007,48 @@ def _build_dynamic_keyboard(
             )]
             for idx, track in enumerate(streams["audio"])
         ] or [_no_tracks_row("⚠️ No audio tracks found")]
-        buttons.append([
-            InlineKeyboardButton(
-                "🔙 Back to Main Menu",
-                callback_data=f"menu:main:{op_id}",
-            )
-        ])
+        buttons.append([InlineKeyboardButton(
+            "🔙 Back to Main Menu",
+            callback_data=f"menu:main:{op_id}",
+        )])
         return InlineKeyboardMarkup(buttons)
 
-    # Multi-select remove audio.
+    if menu == "metadata_subtitle":
+        buttons = [
+            [InlineKeyboardButton(
+                _subtitle_button_label(idx, track),
+                callback_data=f"meta:subtitle:{idx}:{op_id}",
+            )]
+            for idx, track in enumerate(streams["subtitle"])
+        ] or [_no_tracks_row("⚠️ No subtitle tracks found")]
+        buttons.append([InlineKeyboardButton(
+            "🔙 Back to Main Menu",
+            callback_data=f"menu:main:{op_id}",
+        )])
+        return InlineKeyboardMarkup(buttons)
+
+    if menu == "metadata_video":
+        buttons = [
+            [InlineKeyboardButton(
+                _video_button_label(track),
+                callback_data=f"meta:video:{idx}:{op_id}",
+            )]
+            for idx, track in enumerate(streams["video"])
+        ] or [_no_tracks_row("⚠️ No video tracks found")]
+        buttons.append([InlineKeyboardButton(
+            "🔙 Back to Main Menu",
+            callback_data=f"menu:main:{op_id}",
+        )])
+        return InlineKeyboardMarkup(buttons)
+
+    # ── Multi-select remove audio (adds to cart) ──────────────────────────────
     if menu == "remove_audio":
+        remove_set: set[int] = cart.get("remove_audio", set())
         buttons = [
             [InlineKeyboardButton(
                 _toggle_label(
                     _track_button_label(idx, track),
-                    idx in op["selected_audio"],
+                    idx in remove_set,
                 ),
                 callback_data=f"toggle:remove_audio:{idx}:{op_id}",
             )]
@@ -495,23 +1056,20 @@ def _build_dynamic_keyboard(
         ] or [_no_tracks_row("⚠️ No audio tracks found")]
         buttons.append([
             InlineKeyboardButton(
-                "✅ Execute Selected",
-                callback_data=f"exec:remove_audio:{op_id}",
-            ),
-            InlineKeyboardButton(
-                "🔙 Back",
+                "✓ Apply to Cart & Back",
                 callback_data=f"menu:main:{op_id}",
             ),
         ])
         return InlineKeyboardMarkup(buttons)
 
-    # Multi-select remove subtitles.
+    # ── Multi-select remove subtitles (adds to cart) ──────────────────────────
     if menu == "remove_subs":
+        remove_subs_set: set[int] = cart.get("remove_subs", set())
         buttons = [
             [InlineKeyboardButton(
                 _toggle_label(
                     _subtitle_button_label(idx, track),
-                    idx in op["selected_subtitles"],
+                    idx in remove_subs_set,
                 ),
                 callback_data=f"toggle:remove_subs:{idx}:{op_id}",
             )]
@@ -519,17 +1077,13 @@ def _build_dynamic_keyboard(
         ] or [_no_tracks_row("⚠️ No subtitle tracks found")]
         buttons.append([
             InlineKeyboardButton(
-                "✅ Execute Selected",
-                callback_data=f"exec:remove_subs:{op_id}",
-            ),
-            InlineKeyboardButton(
-                "🔙 Back",
+                "✓ Apply to Cart & Back",
                 callback_data=f"menu:main:{op_id}",
             ),
         ])
         return InlineKeyboardMarkup(buttons)
 
-    # Multi-select extraction.
+    # ── Multi-select extraction (still immediate) ─────────────────────────────
     if menu == "extract":
         buttons = []
         if streams["video"]:
@@ -563,7 +1117,7 @@ def _build_dynamic_keyboard(
             buttons.append(_no_tracks_row("⚠️ No tracks available to extract"))
         buttons.append([
             InlineKeyboardButton(
-                "✅ Execute Selected",
+                "✅ Execute Extraction Now",
                 callback_data=f"exec:extract:{op_id}",
             ),
             InlineKeyboardButton(
@@ -573,7 +1127,7 @@ def _build_dynamic_keyboard(
         ])
         return InlineKeyboardMarkup(buttons)
 
-    # External track selection.
+    # ── External track selection ──────────────────────────────────────────────
     if menu == "add_external":
         return InlineKeyboardMarkup(
             [
@@ -592,6 +1146,27 @@ def _build_dynamic_keyboard(
             ]
         )
 
+    # ── Attachment management ─────────────────────────────────────────────────
+    if menu == "manage_attachments":
+        attachments: list[dict] = cart.get("attachments", [])
+        rows_att: list[list[InlineKeyboardButton]] = []
+        for att_idx, att in enumerate(attachments):
+            rows_att.append([InlineKeyboardButton(
+                f"🗑 Remove: {att['filename']}",
+                callback_data=f"attach:remove:{att_idx}:{op_id}",
+            )])
+        rows_att += [
+            [InlineKeyboardButton(
+                "➕ Add Attachment (font/image)",
+                callback_data=f"attach:prompt:{op_id}",
+            )],
+            [InlineKeyboardButton(
+                "🔙 Back to Main Menu",
+                callback_data=f"menu:main:{op_id}",
+            )],
+        ]
+        return InlineKeyboardMarkup(rows_att)
+
     # Fallback: always show a safe main menu.
     return _build_dynamic_keyboard(op_id, op, menu="main")
 
@@ -603,7 +1178,7 @@ async def _execute_mux(
     output_path: str,
     cmd: list,
 ) -> None:
-    """Run FFmpeg, upload the output, and keep the status message in sync."""
+    """Run FFmpeg, upload the output with retry, and keep the status message in sync."""
     await status_msg.edit_text(
         "⚙️ **Muxing (stream-copy, zero encoding)…**",
         reply_markup=None,
@@ -614,14 +1189,19 @@ async def _execute_mux(
         return
 
     await status_msg.edit_text("⬆️ **Uploading…**")
-    await client.send_document(
-        chat_id=chat_id,
-        document=output_path,
-        caption="✅ **Muxing complete!**",
-        progress=_progress,
-        progress_args=(status_msg, "Uploading"),
-    )
-    await status_msg.edit_text("✅ **Done! File uploaded.**", reply_markup=None)
+    try:
+        await _upload_with_retry(
+            client=client,
+            chat_id=chat_id,
+            file_path=output_path,
+            caption="✅ **Muxing complete!**",
+            status_msg=status_msg,
+        )
+        await status_msg.edit_text("✅ **Done! File uploaded.**", reply_markup=None)
+    except Exception as exc:
+        await status_msg.edit_text(
+            f"❌ **Upload failed after retries:** `{exc}`", reply_markup=None
+        )
 
 
 async def _issue_metadata_prompt(
@@ -633,17 +1213,30 @@ async def _issue_metadata_prompt(
     input_path: str,
     output_path: str,
     prompt_text: str | None = None,
+    for_cart: bool = False,
 ) -> None:
-    """Send a ForceReply prompt and register the reply-to-op lookup."""
+    """Send a ForceReply prompt and register the reply-to-op lookup.
+
+    When *for_cart* is True the text reply handler will store the result in
+    the shopping cart instead of executing FFmpeg immediately.
+
+    Prompt format:
+        ``New title (optionally: Title | lang_code)``
+    """
     # Prompts are issued on the single asyncio event loop, so mapping updates are
     # serialized per update and safe for this lightweight in-memory state.
     _clear_metadata_prompt(op.get("awaiting_metadata_msg_id"))
     op["awaiting_metadata_for_track"] = track_idx
     op["awaiting_metadata_stream_type"] = stream_type
+    op["awaiting_metadata_for_cart"] = for_cart
     op["metadata_input_path"] = input_path
     op["metadata_output_path"] = output_path
     prompt = await reply_target.reply(
-        prompt_text or f"📝 **Send new title for Track {track_idx + 1}.**",
+        prompt_text
+        or (
+            f"📝 **Send new metadata for Track {track_idx + 1}.**\n"
+            "Format: `New Title` or `New Title | lang` (e.g. `English DTS-HD | eng`)"
+        ),
         reply_markup=ForceReply(selective=True),
     )
     op["awaiting_metadata_msg_id"] = prompt.id
@@ -784,32 +1377,40 @@ async def _upload_post_add_result(
         return
 
     await status_msg.edit_text("⬆️ **Uploading…**", reply_markup=None)
-    await client.send_document(
-        chat_id=op["chat_id"],
-        document=output_path,
-        caption="✅ **Muxing complete!**",
-        progress=_progress,
-        progress_args=(status_msg, "Uploading"),
-    )
-    await status_msg.edit_text("✅ **Done! File uploaded.**", reply_markup=None)
-
-    _cleanup(op["input"], output_path, op.get("external_input_path") or "")
+    try:
+        await _upload_with_retry(
+            client=client,
+            chat_id=op["chat_id"],
+            file_path=output_path,
+            caption="✅ **Muxing complete!**",
+            status_msg=status_msg,
+        )
+        await status_msg.edit_text("✅ **Done! File uploaded.**", reply_markup=None)
+    except Exception as exc:
+        await status_msg.edit_text(
+            f"❌ **Upload failed:** `{exc}`", reply_markup=None
+        )
+    # Files are retained for FILE_RETENTION_MINUTES; background loop handles deletion.
     pending_ops.pop(op_id, None)
 
 
 # ── Message handler ───────────────────────────────────────────────────────────
 
 @app.on_message(
-    filters.user(ADMIN_USER_ID) & (filters.video | filters.document)
+    filters.user(ADMIN_USER_IDS) & (filters.video | filters.document)
 )
 async def on_video(client: Client, message: Message) -> None:
-    """Auto-detect MKV/MP4, download, probe, and present mux options."""
+    """Auto-detect MKV/MP4, download with fast_download, probe, and present mux options."""
     # Prevent external-track reply prompts from being treated as new video tasks.
     if message.reply_to_message and message.reply_to_message.id in pending_external_prompts:
         await message.reply(
             "❌ External track prompt active. Reply with an audio/document file, not a video."
         )
         return
+    # Prevent attachment upload prompts from being treated as new video tasks.
+    if message.reply_to_message and message.reply_to_message.id in pending_attachment_prompts:
+        return
+
     file_obj = message.video or message.document
     if file_obj is None:
         return
@@ -821,25 +1422,25 @@ async def on_video(client: Client, message: Message) -> None:
     if ext not in (".mkv", ".mp4") and not mime.startswith("video/"):
         return
 
-    # Sanitize filename — strip any path components
+    # Sanitize filename — strip any path components.
     safe_name = (
         Path(raw_name).name
         if raw_name
-        else f"video_{file_obj.file_unique_id}{ext or '.mp4'}"
+        else f"video_{file_obj.file_unique_id}{ext or '.mkv'}"
     )
     safe_name = _sanitize_filename(safe_name)
     input_path = DOWNLOADS_DIR / safe_name
 
     status_msg = await message.reply("⬇️ **Downloading…**")
 
-    try:
-        await client.download_media(
-            message,
-            file_name=str(input_path),
-            progress=_progress,
-            progress_args=(status_msg, "Downloading"),
-        )
-    except Exception:
+    ok = await fast_download(
+        client=client,
+        message=message,
+        file_path=input_path,
+        status_msg=status_msg,
+        label="Downloading",
+    )
+    if not ok:
         await status_msg.edit_text("❌ Download failed.")
         _cleanup(str(input_path))
         return
@@ -853,12 +1454,11 @@ async def on_video(client: Client, message: Message) -> None:
         "streams": streams,
         "chat_id": message.chat.id,
         "safe_name": safe_name,
-        "selected_audio": set(),
-        "selected_subtitles": set(),
         "selected_extract": set(),
         "awaiting_metadata_for_track": None,
         "awaiting_metadata_stream_type": None,
         "awaiting_metadata_msg_id": None,
+        "awaiting_metadata_for_cart": False,
         "metadata_input_path": None,
         "metadata_output_path": None,
         "awaiting_external_type": None,
@@ -868,17 +1468,25 @@ async def on_video(client: Client, message: Message) -> None:
         "post_add_output_path": None,
         "post_add_stream_type": None,
         "post_add_track_idx": None,
+        "awaiting_attachment_msg_id": None,
+        # Shopping cart — accumulate changes; compile into one FFmpeg command.
+        "cart": {
+            "remove_audio": set(),
+            "remove_subs": set(),
+            "metadata": {},       # {(kind, orig_idx): {title, language}}
+            "attachments": [],    # [{path, mimetype, filename}]
+        },
     }
 
     await status_msg.edit_text(
-        _render_menu_text(safe_name, streams, "main"),
+        _render_menu_text(safe_name, streams, "main", pending_ops[op_id]),
         reply_markup=_build_dynamic_keyboard(op_id, pending_ops[op_id], "main"),
     )
 
 
 # ── Callback handler ──────────────────────────────────────────────────────────
 
-@app.on_callback_query(filters.user(ADMIN_USER_ID))
+@app.on_callback_query(filters.user(ADMIN_USER_IDS))
 async def on_callback(client: Client, query: CallbackQuery) -> None:
     """Dispatch inline button presses."""
     data: str = query.data or ""
@@ -896,6 +1504,10 @@ async def on_callback(client: Client, query: CallbackQuery) -> None:
         if op:
             _clear_metadata_prompt(op.get("awaiting_metadata_msg_id"))
             _clear_external_prompt(op.get("awaiting_external_msg_id"))
+            _clear_attachment_prompt(op.get("awaiting_attachment_msg_id"))
+            # Cleanup attachment files from cart (they are temp files).
+            for att in op.get("cart", {}).get("attachments", []):
+                _cleanup(att.get("path", ""))
             _cleanup(op["input"])
             _cleanup(op.get("external_input_path") or "")
             _cleanup(op.get("post_add_output_path") or "")
@@ -906,6 +1518,69 @@ async def on_callback(client: Client, query: CallbackQuery) -> None:
         await query.answer("Cancelled.")
         return
 
+    # ── Cart: clear all pending changes ──────────────────────────────────────
+    if action == "cart_clear" and len(parts) == 2:
+        op = pending_ops.get(parts[1])
+        if op is None:
+            await query.answer("Session expired.", show_alert=True)
+            return
+        # Remove attachment files from disk (they are small temp copies).
+        for att in op["cart"].get("attachments", []):
+            _cleanup(att.get("path", ""))
+        op["cart"] = {
+            "remove_audio": set(),
+            "remove_subs": set(),
+            "metadata": {},
+            "attachments": [],
+        }
+        await query.message.edit_text(
+            _render_menu_text(op["safe_name"], op["streams"], "main", op),
+            reply_markup=_build_dynamic_keyboard(parts[1], op, "main"),
+        )
+        await query.answer("🗑 Cart cleared.")
+        return
+
+    # ── Cart: execute all queued changes in ONE FFmpeg command ────────────────
+    if action == "cart_exec" and len(parts) == 2:
+        op_id = parts[1]
+        op = pending_ops.get(op_id)
+        if op is None:
+            await query.answer("Session expired. Please resend the file.", show_alert=True)
+            return
+        if not _cart_has_changes(op):
+            await query.answer("Cart is empty — nothing to execute.", show_alert=True)
+            return
+
+        input_path: str = op["input"]
+        cart = op["cart"]
+
+        # Determine output extension: use MKV when attachments are present
+        # (MKV is the only common container that supports -attach natively).
+        has_atts = bool(cart.get("attachments"))
+        out_ext = ".mkv" if has_atts or Path(input_path).suffix.lower() == ".mkv" else ".mp4"
+        output_path = _output_path_for(input_path, "cart", out_ext)
+
+        cmd = _build_cart_ffmpeg_cmd(input_path, output_path, op)
+
+        _clear_metadata_prompt(op.get("awaiting_metadata_msg_id"))
+        _clear_external_prompt(op.get("awaiting_external_msg_id"))
+        pending_ops.pop(op_id, None)
+
+        try:
+            await _execute_mux(
+                client=client,
+                status_msg=query.message,
+                chat_id=op["chat_id"],
+                output_path=output_path,
+                cmd=cmd,
+            )
+        finally:
+            # Clean up any attachment temp files after muxing.
+            for att in cart.get("attachments", []):
+                _cleanup(att.get("path", ""))
+        await query.answer()
+        return
+
     # ── Menu navigation (no mux yet) ─────────────────────────────────────────
     if action == "menu" and len(parts) == 3:
         _, menu, op_id = parts
@@ -914,13 +1589,13 @@ async def on_callback(client: Client, query: CallbackQuery) -> None:
             await query.answer("Session expired. Please resend the file.", show_alert=True)
             return
         await query.message.edit_text(
-            _render_menu_text(op["safe_name"], op["streams"], menu),
+            _render_menu_text(op["safe_name"], op["streams"], menu, op),
             reply_markup=_build_dynamic_keyboard(op_id, op, menu),
         )
         await query.answer()
         return
 
-    # ── Toggle multi-select state ────────────────────────────────────────────
+    # ── Toggle multi-select state (now writes directly to cart) ──────────────
     if action == "toggle" and len(parts) >= 4:
         parsed = _parse_toggle_callback(parts)
         if parsed is None:
@@ -932,22 +1607,24 @@ async def on_callback(client: Client, query: CallbackQuery) -> None:
             await query.answer("Session expired. Please resend the file.", show_alert=True)
             return
 
+        cart = op["cart"]
         if stream_key == "remove_audio":
             if not _is_track_index_in_range(track_idx, op["streams"]["audio"]):
                 await query.answer("Track out of range.", show_alert=True)
                 return
-            if track_idx in op["selected_audio"]:
-                op["selected_audio"].remove(track_idx)
+            # Toggle in cart.remove_audio (cart-based, not immediate).
+            if track_idx in cart["remove_audio"]:
+                cart["remove_audio"].discard(track_idx)
             else:
-                op["selected_audio"].add(track_idx)
+                cart["remove_audio"].add(track_idx)
         elif stream_key == "remove_subs":
             if not _is_track_index_in_range(track_idx, op["streams"]["subtitle"]):
                 await query.answer("Track out of range.", show_alert=True)
                 return
-            if track_idx in op["selected_subtitles"]:
-                op["selected_subtitles"].remove(track_idx)
+            if track_idx in cart["remove_subs"]:
+                cart["remove_subs"].discard(track_idx)
             else:
-                op["selected_subtitles"].add(track_idx)
+                cart["remove_subs"].add(track_idx)
         else:
             key = f"{stream_key}:{track_idx}"
             if stream_key == "v" and not op["streams"]["video"]:
@@ -965,13 +1642,13 @@ async def on_callback(client: Client, query: CallbackQuery) -> None:
                 op["selected_extract"].add(key)
 
         await query.message.edit_text(
-            _render_menu_text(op["safe_name"], op["streams"], menu),
+            _render_menu_text(op["safe_name"], op["streams"], menu, op),
             reply_markup=_build_dynamic_keyboard(op_id, op, menu),
         )
         await query.answer()
         return
 
-    # ── Execute multi-select actions ─────────────────────────────────────────
+    # ── Execute extract (still immediate — separate output files) ────────────
     if action == "exec" and len(parts) == 3:
         _, exec_mode, op_id = parts
         op = pending_ops.get(op_id)
@@ -979,100 +1656,51 @@ async def on_callback(client: Client, query: CallbackQuery) -> None:
             await query.answer("Session expired. Please resend the file.", show_alert=True)
             return
 
-        input_path = op["input"]
-        chat_id = op["chat_id"]
-        output_path = _output_path_for(input_path, exec_mode)
-
-        if exec_mode == "remove_audio":
-            if not op["selected_audio"]:
-                await query.answer("Select at least one audio track.", show_alert=True)
-                return
-            audio_keep = [
-                idx for idx in range(len(op["streams"]["audio"]))
-                if idx not in op["selected_audio"]
-            ]
-            subtitle_keep = list(range(len(op["streams"]["subtitle"])))
-            cmd = [
-                "ffmpeg", "-y", "-i", input_path,
-                *_build_keep_map_args(audio_keep, subtitle_keep, bool(op["streams"]["video"])),
-                "-c", "copy",
-                output_path,
-            ]
-        elif exec_mode == "remove_subs":
-            if not op["selected_subtitles"]:
-                await query.answer("Select at least one subtitle track.", show_alert=True)
-                return
-            audio_keep = list(range(len(op["streams"]["audio"])))
-            subtitle_keep = [
-                idx for idx in range(len(op["streams"]["subtitle"]))
-                if idx not in op["selected_subtitles"]
-            ]
-            cmd = [
-                "ffmpeg", "-y", "-i", input_path,
-                *_build_keep_map_args(audio_keep, subtitle_keep, bool(op["streams"]["video"])),
-                "-c", "copy",
-                output_path,
-            ]
-        elif exec_mode == "extract":
-            if not op["selected_extract"]:
-                await query.answer("Select at least one track.", show_alert=True)
-                return
-            selected = sorted(op["selected_extract"])
-            outputs: list[str] = []
-            try:
-                status_msg = await query.message.reply("⚙️ **Extracting…**")
-                for key in selected:
-                    stream_type, idx_str = key.split(":")
-                    track_idx = int(idx_str)
-                    if stream_type == "v":
-                        ext = _video_container_extension(input_path)
-                        extract_path = _output_path_for(input_path, "video", ext)
-                        cmd = _build_extract_cmd(input_path, extract_path, "video", track_idx)
-                    elif stream_type == "a":
-                        track = op["streams"]["audio"][track_idx]
-                        ext = _codec_extension(track.get("codec_name"), AUDIO_CODEC_EXTENSIONS)
-                        extract_path = _output_path_for(input_path, f"a{track_idx + 1}", ext)
-                        cmd = _build_extract_cmd(input_path, extract_path, "audio", track_idx)
-                    else:
-                        track = op["streams"]["subtitle"][track_idx]
-                        ext = _codec_extension(track.get("codec_name"), SUBTITLE_CODEC_EXTENSIONS)
-                        extract_path = _output_path_for(input_path, f"s{track_idx + 1}", ext)
-                        cmd = _build_extract_cmd(input_path, extract_path, "subtitle", track_idx)
-                    outputs.append(extract_path)
-                    await _execute_mux(
-                        client=client,
-                        status_msg=status_msg,
-                        chat_id=chat_id,
-                        output_path=extract_path,
-                        cmd=cmd,
-                    )
-                await query.answer("Extraction complete.")
-            finally:
-                _cleanup(input_path, *outputs)
-                pending_ops.pop(op_id, None)
-            return
-        else:
+        if exec_mode != "extract":
             await query.answer("Unknown execution mode.", show_alert=True)
             return
 
-        # We are executing now, so remove the op from the registry.
-        _clear_metadata_prompt(op.get("awaiting_metadata_msg_id"))
-        _clear_external_prompt(op.get("awaiting_external_msg_id"))
-        pending_ops.pop(op_id, None)
+        if not op["selected_extract"]:
+            await query.answer("Select at least one track.", show_alert=True)
+            return
+
+        input_path = op["input"]
+        chat_id = op["chat_id"]
+        selected = sorted(op["selected_extract"])
+        outputs: list[str] = []
         try:
-            await _execute_mux(
-                client=client,
-                status_msg=query.message,
-                chat_id=chat_id,
-                output_path=output_path,
-                cmd=cmd,
-            )
+            status_msg = await query.message.reply("⚙️ **Extracting…**")
+            for key in selected:
+                stream_type, idx_str = key.split(":")
+                track_idx = int(idx_str)
+                if stream_type == "v":
+                    ext = _video_container_extension(input_path)
+                    extract_path = _output_path_for(input_path, "video", ext)
+                    cmd = _build_extract_cmd(input_path, extract_path, "video", track_idx)
+                elif stream_type == "a":
+                    track = op["streams"]["audio"][track_idx]
+                    ext = _codec_extension(track.get("codec_name"), AUDIO_CODEC_EXTENSIONS)
+                    extract_path = _output_path_for(input_path, f"a{track_idx + 1}", ext)
+                    cmd = _build_extract_cmd(input_path, extract_path, "audio", track_idx)
+                else:
+                    track = op["streams"]["subtitle"][track_idx]
+                    ext = _codec_extension(track.get("codec_name"), SUBTITLE_CODEC_EXTENSIONS)
+                    extract_path = _output_path_for(input_path, f"s{track_idx + 1}", ext)
+                    cmd = _build_extract_cmd(input_path, extract_path, "subtitle", track_idx)
+                outputs.append(extract_path)
+                await _execute_mux(
+                    client=client,
+                    status_msg=status_msg,
+                    chat_id=chat_id,
+                    output_path=extract_path,
+                    cmd=cmd,
+                )
+            await query.answer("Extraction complete.")
         finally:
-            _cleanup(input_path, output_path)
-        await query.answer()
+            pending_ops.pop(op_id, None)
         return
 
-    # ── Metadata track selection (await text reply) ──────────────────────────
+    # ── Metadata track selection → issue ForceReply prompt (cart mode) ────────
     if action == "meta" and len(parts) == 4:
         _, stream_type, track_str, op_id = parts
         op = pending_ops.get(op_id)
@@ -1084,15 +1712,26 @@ async def on_callback(client: Client, query: CallbackQuery) -> None:
         except ValueError:
             await query.answer("Invalid track selection.", show_alert=True)
             return
-        track_list = op["streams"]["audio"] if stream_type == "audio" else op["streams"]["subtitle"]
+
+        if stream_type == "audio":
+            track_list = op["streams"]["audio"]
+        elif stream_type == "subtitle":
+            track_list = op["streams"]["subtitle"]
+        elif stream_type == "video":
+            track_list = op["streams"]["video"]
+        else:
+            await query.answer("Unknown stream type.", show_alert=True)
+            return
+
         if not _is_track_index_in_range(track_idx, track_list):
             await query.answer("Track out of range.", show_alert=True)
             return
 
         input_path: str = op["input"]
+        # Output path only needed for immediate (post-add) mode; set a placeholder.
         output_path = _output_path_for(input_path, "metadata")
 
-        # Remember which track is awaiting metadata so the reply handler can map it.
+        # Cart mode: store result in cart, do NOT execute FFmpeg immediately.
         await _issue_metadata_prompt(
             reply_target=query.message,
             op_id=op_id,
@@ -1101,9 +1740,48 @@ async def on_callback(client: Client, query: CallbackQuery) -> None:
             stream_type=stream_type,
             input_path=input_path,
             output_path=output_path,
+            for_cart=True,
         )
-        await query.answer("Waiting for new title…")
+        await query.answer("Waiting for metadata…")
         return
+
+    # ── Attachment: prompt upload or remove from cart ─────────────────────────
+    if action == "attach" and len(parts) >= 3:
+        attach_action = parts[1]
+        op_id = parts[-1]
+        op = pending_ops.get(op_id)
+        if op is None:
+            await query.answer("Session expired. Please resend the file.", show_alert=True)
+            return
+
+        if attach_action == "prompt":
+            # Send ForceReply to request an attachment file.
+            _clear_attachment_prompt(op.get("awaiting_attachment_msg_id"))
+            prompt = await query.message.reply(
+                "📎 **Upload your attachment file** (.ttf / .otf / .jpg / .png).",
+                reply_markup=ForceReply(selective=True),
+            )
+            op["awaiting_attachment_msg_id"] = prompt.id
+            pending_attachment_prompts[prompt.id] = op_id
+            await query.answer("Waiting for file…")
+            return
+
+        if attach_action == "remove" and len(parts) == 4:
+            try:
+                att_idx = int(parts[2])
+            except ValueError:
+                await query.answer("Invalid index.", show_alert=True)
+                return
+            attachments = op["cart"].get("attachments", [])
+            if 0 <= att_idx < len(attachments):
+                removed = attachments.pop(att_idx)
+                _cleanup(removed.get("path", ""))
+            await query.message.edit_text(
+                _render_menu_text(op["safe_name"], op["streams"], "manage_attachments", op),
+                reply_markup=_build_dynamic_keyboard(op_id, op, "manage_attachments"),
+            )
+            await query.answer("Attachment removed from cart.")
+            return
 
     # ── External track selection and conversion prompts ──────────────────────
     if action == "external" and len(parts) == 3:
@@ -1166,7 +1844,11 @@ async def on_callback(client: Client, query: CallbackQuery) -> None:
                 stream_type=stream_type,
                 input_path=output_path,
                 output_path=titled_output,
-                prompt_text="📝 **Send the new title for the added track.**",
+                prompt_text=(
+                    "📝 **Send the new title for the added track.**\n"
+                    "Format: `Title` or `Title | lang`"
+                ),
+                for_cart=False,  # post-add metadata executes immediately
             )
             await query.answer("Waiting for title…")
             return
@@ -1199,7 +1881,12 @@ async def on_callback(client: Client, query: CallbackQuery) -> None:
         _clear_external_prompt(op.get("awaiting_external_msg_id"))
         input_path: str = op["input"]
         chat_id: int = op["chat_id"]
-        output_path = _output_path_for(input_path, mode)
+        # Choose extension: keep MKV for MKV inputs, convert to MKV for others
+        in_ext = Path(input_path).suffix.lower()
+        output_path = _output_path_for(
+            input_path, mode,
+            ".mp4" if mode == "convert" and in_ext == ".mp4" else ".mkv",
+        )
 
         try:
             if mode == "remove_all_subs":
@@ -1231,26 +1918,71 @@ async def on_callback(client: Client, query: CallbackQuery) -> None:
                 output_path=output_path,
                 cmd=cmd,
             )
-        finally:
-            # Guaranteed cleanup regardless of success or failure
-            _cleanup(
-                input_path,
-                output_path,
-                op.get("external_input_path") or "",
-                op.get("post_add_output_path") or "",
-            )
+        # Files retained by background loop; no immediate cleanup here.
 
     await query.answer()
 
 
-# ── External track upload handler ─────────────────────────────────────────────
+# ── Upload handler: external tracks AND attachments ───────────────────────────
 
-@app.on_message(filters.user(ADMIN_USER_ID) & (filters.document | filters.audio) & filters.reply)
+@app.on_message(filters.user(ADMIN_USER_IDS) & (filters.document | filters.audio) & filters.reply)
 async def on_external_upload(client: Client, message: Message) -> None:
-    """Handle external audio/subtitle uploads for add-track operations."""
+    """Handle document/audio replies for both external tracks and cart attachments."""
     prompt_id = message.reply_to_message.id if message.reply_to_message else None
     if prompt_id is None:
         return
+
+    # ── Attachment upload path ────────────────────────────────────────────────
+    if prompt_id in pending_attachment_prompts:
+        op_id = pending_attachment_prompts.get(prompt_id)
+        if op_id is None:
+            return
+        op = pending_ops.get(op_id)
+        if op is None or op.get("chat_id") != message.chat.id:
+            _clear_attachment_prompt(prompt_id)
+            return
+
+        file_obj = message.document or message.audio
+        if file_obj is None:
+            return
+
+        raw_name = getattr(file_obj, "file_name", None) or ""
+        ext = Path(raw_name).suffix.lower() if raw_name else ""
+        mime = _attachment_mimetype(raw_name or f"file{ext}")
+        safe_name = Path(raw_name).name if raw_name else f"attach_{file_obj.file_unique_id}{ext or '.bin'}"
+        safe_name = _sanitize_filename(safe_name)
+        att_path = DOWNLOADS_DIR / f"attach_{op_id}_{safe_name}"
+
+        status_msg = await message.reply("⬇️ **Downloading attachment…**")
+        start_time = time.monotonic()
+        try:
+            await client.download_media(
+                message,
+                file_name=str(att_path),
+                progress=_progress,
+                progress_args=(status_msg, "Downloading", start_time, 0, False),
+            )
+        except Exception as exc:
+            await status_msg.edit_text(
+                f"❌ Attachment download failed ({type(exc).__name__}). Please retry."
+            )
+            _cleanup(str(att_path))
+            return
+
+        _clear_attachment_prompt(prompt_id)
+        op["awaiting_attachment_msg_id"] = None
+        op["cart"]["attachments"].append({
+            "path": str(att_path),
+            "mimetype": mime,
+            "filename": safe_name,
+        })
+        await status_msg.edit_text(
+            f"✅ **Attachment added to cart:** `{safe_name}` (`{mime}`)",
+            reply_markup=_build_dynamic_keyboard(op_id, op, "manage_attachments"),
+        )
+        return
+
+    # ── External track upload path ────────────────────────────────────────────
     op_id = pending_external_prompts.get(prompt_id)
     if op_id is None:
         return
@@ -1270,6 +2002,7 @@ async def on_external_upload(client: Client, message: Message) -> None:
     external_path = DOWNLOADS_DIR / f"external_{op_id}_{safe_name}"
 
     status_msg = await message.reply("⬇️ **Downloading external file…**")
+    start_time_ext = time.monotonic()
     try:
         await client.download_media(
             message,
